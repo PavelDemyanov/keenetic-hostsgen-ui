@@ -1,0 +1,24 @@
+#!/bin/sh
+# hostsgen-ui: встраивает модуль «Добавить списком» в веб-интерфейс KeeneticOS.
+# Всю работу делает статическая программа hostsgen-ui, здесь — только выбор сборки под процессор.
+# Скрипт рассчитан на /bin/sh прошивки: без Entware в системе нет ни uname, ни других утилит.
+
+D=/opt/share/hostsgen-ui
+
+# Процессор — по заголовку ELF самого /bin/sh: разрядность и порядок байтов.
+read -r elf </bin/sh
+case "$elf" in
+	"$(printf '\177ELF\002\001')"*) arch=aarch64 ;;
+	"$(printf '\177ELF\001\001')"*) arch=mipsel ;;
+	"$(printf '\177ELF\001\002')"*) arch=mips ;;
+	*) arch=unknown ;;
+esac
+
+# Сборка из архива — в приоритете: start обновит по ней постоянную копию, которую вызывает веб-модуль.
+helper=$D/bin/hostsgen-ui.$arch
+[ -f "$helper" ] || helper=$D/hostsgen-ui
+if [ ! -f "$helper" ]; then
+	echo "hostsgen-ui: нет сборки под этот процессор ($arch) в $D" >&2
+	exit 1
+fi
+exec "$helper" "${1:-start}"

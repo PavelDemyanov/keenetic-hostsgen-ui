@@ -1,0 +1,22 @@
+#!/bin/sh
+# Сценарий запуска OPKG для установки hostsgen-ui без Entware: KeeneticOS по умолчанию ищет
+# /opt/etc/initrc и вызывает его при подключении накопителя (start) и перед отключением (stop).
+# Запускает /opt/etc/init.d/S* по порядку, при остановке — в обратном, как rc.unslung из Entware.
+# Если позже поставить Entware, он заменит этот сценарий своим rc.unslung — модуль продолжит работать.
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+action=${1:-start}
+scripts=""
+for script in /opt/etc/init.d/S*; do
+	[ -x "$script" ] || continue
+	case "$action" in
+		stop | kill) scripts="$script $scripts" ;;
+		*) scripts="$scripts $script" ;;
+	esac
+done
+for script in $scripts; do
+	"$script" "$action"
+done
+exit 0
