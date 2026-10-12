@@ -43,6 +43,10 @@ KeeneticOS 5. Домены, IP-адреса, подсети, строки `route
 ./deploy.sh uninstall         # вернуть родной интерфейс, удалить файлы
 ```
 
+Выпуск: поднять `VERSION` в `helper/hostsgen-ui.c`, `./build.sh`, закоммитить и запушить, затем
+`gh release create vX.Y.Z dist/install/hostsgen-ui.tar.gz --repo PavelDemyanov/keenetic-hostsgen-ui`.
+Кнопка «Скачать» в README ведёт на `releases/latest/download/hostsgen-ui.tar.gz` — имя файла не менять.
+
 `build.sh` нужен `zig` в PATH (проверено на 0.17.0). ziglang.org и ghcr.io (бутылки Homebrew) отсюда
 душат; официальный архив `zig-aarch64-macos-<версия>.tar.xz` быстро отдаёт зеркало fs.liujiacai.net/zigbuilds
 (список зеркал — ziglang.org/download/community-mirrors.txt), хеш сверять со вторым зеркалом.
