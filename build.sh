@@ -1,7 +1,7 @@
 #!/bin/bash
-# Сборка hostsgen-ui: программа-помощник и SSH-клиент под три процессора Keenetic и архив для установки
+# Сборка hostsgen-ui: программа-помощник и SSH-клиент под три процессора Keenetic и архивы для установки
 # через веб-интерфейс (папка install на накопителе OPKG).
-#   dist/install/hostsgen-ui.tar.gz — пути внутри относительно /opt, как у установщика Entware
+#   dist/install/hostsgen-ui-{mipsel,mips,aarch64}.tar.gz — по архиву на процессор, пути внутри относительно /opt
 # Нужны: node (тесты веб-модулей), zig (кросс-компиляция C со статическим musl), python3, curl.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -14,10 +14,10 @@ command -v zig >/dev/null || { echo "нет zig в PATH" >&2; exit 1; }
 
 node --test tests/*.test.js
 
-PKG=dist/pkg
+BIN=dist/bin
 CACHE=.cache
 rm -rf dist
-mkdir -p "$PKG/etc/init.d" "$PKG/share/hostsgen-ui/bin" dist/install "$CACHE"
+mkdir -p "$BIN" dist/install "$CACHE"
 
 # mipsel — MT7621 (Giga KN-1010/1011 и др.), mips — EcoNet (DSL-модели), aarch64 — MT7981/MT7622/MT7988.
 # На MIPS у Keenetic нет FPU: собираем с программной плавающей точкой.
@@ -26,7 +26,7 @@ BUILDS="mipsel:mipsel-linux-musleabi:-msoft-float mips:mips-linux-musleabi:-msof
 for build in $BUILDS; do
 	IFS=: read -r arch target extra <<<"$build"
 	zig cc -target "$target" $extra -Os -s -static -Wall -Wextra -Werror \
-		-o "$PKG/share/hostsgen-ui/bin/hostsgen-ui.$arch" helper/hostsgen-ui.c
+		-o "$BIN/hostsgen-ui.$arch" helper/hostsgen-ui.c
 done
 
 # SSH-клиент dbclient из dropbear: в прошивке dropbear есть только сервер. Исходники — с сайта автора,
@@ -65,19 +65,30 @@ for build in $BUILDS; do
 		cp "$work/dbclient" "$out"
 		rm -rf "$work"
 	fi
-	cp "$out" "$PKG/share/hostsgen-ui/bin/dbclient.$arch"
+	cp "$out" "$BIN/dbclient.$arch"
 done
-cp "$CACHE/dropbear-$DROPBEAR/LICENSE" "$PKG/share/hostsgen-ui/LICENSE.dropbear"
 
 # Веб-модули встраиваются одним скриптом: сначала общая часть, на которую опираются остальные
-cat web/common.js web/addon.js web/vps.js >"$PKG/share/hostsgen-ui/addon.js"
-cp server/vps-setup.sh "$PKG/share/hostsgen-ui/"
-cp router/S99hostsgen-ui "$PKG/etc/init.d/"
-cp router/initrc "$PKG/etc/"
-chmod 755 "$PKG/etc/initrc" "$PKG/etc/init.d/S99hostsgen-ui" "$PKG"/share/hostsgen-ui/bin/*
-chmod 644 "$PKG/share/hostsgen-ui/addon.js" "$PKG/share/hostsgen-ui/vps-setup.sh" "$PKG/share/hostsgen-ui/LICENSE.dropbear"
+cat web/common.js web/addon.js web/vps.js >dist/addon.js
 
-# не tar из macOS: его заголовки распаковщик прошивки отвергает (подробности в tools/pack.py)
-python3 -I tools/pack.py "$PKG" dist/install/hostsgen-ui.tar.gz
+# Архив под каждый процессор. Прошивка запускает initrc и вообще скрипты из /opt только через /opt/bin/sh,
+# лежащую в /opt, — обычно её привозит Entware. Без Entware её даёт наш архив: ссылку на помощник своего
+# процессора (helper/hostsgen-ui.c, sh_mode). Только ссылкой: обычный файл npkg пишет сквозь существующую
+# ссылку и затёр бы busybox Entware; ссылку Entware sh → busybox помощник возвращает при первом запуске.
+for build in $BUILDS; do
+	IFS=: read -r arch target extra <<<"$build"
+	pkg=dist/pkg-$arch
+	mkdir -p "$pkg/bin" "$pkg/etc/init.d" "$pkg/share/hostsgen-ui/bin"
+	ln -s "/opt/share/hostsgen-ui/bin/hostsgen-ui.$arch" "$pkg/bin/sh"
+	cp "$BIN/hostsgen-ui.$arch" "$BIN/dbclient.$arch" "$pkg/share/hostsgen-ui/bin/"
+	cp dist/addon.js server/vps-setup.sh "$pkg/share/hostsgen-ui/"
+	cp "$CACHE/dropbear-$DROPBEAR/LICENSE" "$pkg/share/hostsgen-ui/LICENSE.dropbear"
+	cp router/S99hostsgen-ui "$pkg/etc/init.d/"
+	cp router/initrc "$pkg/etc/"
+	chmod 755 "$pkg/etc/initrc" "$pkg/etc/init.d/S99hostsgen-ui" "$pkg"/share/hostsgen-ui/bin/*
+	chmod 644 "$pkg/share/hostsgen-ui/addon.js" "$pkg/share/hostsgen-ui/vps-setup.sh" "$pkg/share/hostsgen-ui/LICENSE.dropbear"
+	# не tar из macOS: его заголовки распаковщик прошивки отвергает (подробности в tools/pack.py)
+	python3 -I tools/pack.py "$pkg" "dist/install/hostsgen-ui-$arch.tar.gz"
+done
 
-ls -l "$PKG/share/hostsgen-ui/bin" dist/install/hostsgen-ui.tar.gz
+ls -l "$BIN" dist/install

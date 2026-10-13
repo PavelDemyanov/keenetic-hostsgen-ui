@@ -1,6 +1,7 @@
 #!/bin/bash
 # Выкладка собранного hostsgen-ui (./build.sh) на роутер, где уже есть Entware и вход по SSH.
-# Для роутеров без Entware — архив dist/install/hostsgen-ui.tar.gz и инструкция в README.md.
+# Для роутеров без Entware — архивы dist/install/hostsgen-ui-<процессор>.tar.gz и инструкция в README.md.
+# Процессор роутера — переменная ARCH (mipsel, mips, aarch64), по умолчанию mipsel.
 #   ./deploy.sh            — выложить dist/pkg и перевстроить модуль
 #   ./deploy.sh status     — встроен ли модуль сейчас
 #   ./deploy.sh uninstall  — вернуть родной интерфейс и удалить файлы с роутера
@@ -9,15 +10,18 @@ cd "$(dirname "$0")"
 
 ROUTER=${ROUTER:-root@192.168.0.1}
 PORT=${PORT:-222}
+ARCH=${ARCH:-mipsel}
+ARCHIVE=dist/install/hostsgen-ui-$ARCH.tar.gz
 ssh_router() { ssh -o BatchMode=yes -p "$PORT" "$ROUTER" "$@"; }
 
 case "${1:-deploy}" in
 	deploy)
-		[ -f dist/install/hostsgen-ui.tar.gz ] || { echo "сначала ./build.sh" >&2; exit 1; }
-		# etc/initrc из архива не кладём: на роутере с Entware сценарий запуска — его rc.unslung
+		[ -f "$ARCHIVE" ] || { echo "сначала ./build.sh" >&2; exit 1; }
+		# etc/initrc и bin/sh из архива не кладём: на роутере с Entware сценарий запуска — его rc.unslung,
+		# а /opt/bin/sh — его busybox
 		ssh_router 'set -e; t=$(mktemp -d); tar -xzf - -C "$t"; mkdir -p /opt/share/hostsgen-ui;
 			cp -r "$t"/share/hostsgen-ui/. /opt/share/hostsgen-ui/; cp "$t"/etc/init.d/S99hostsgen-ui /opt/etc/init.d/;
-			rm -rf "$t" /opt/share/hostsgen-ui/resolve.sh' <dist/install/hostsgen-ui.tar.gz
+			rm -rf "$t" /opt/share/hostsgen-ui/resolve.sh' <"$ARCHIVE"
 		ssh_router '/opt/etc/init.d/S99hostsgen-ui restart'
 		;;
 	status)

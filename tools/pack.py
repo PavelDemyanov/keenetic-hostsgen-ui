@@ -2,8 +2,9 @@
 
 Распаковщик npkg в KeeneticOS принимает только числовые поля заголовка, оканчивающиеся NUL (так пишет
 GNU tar); архив от bsdtar из macOS (поля с пробелом в конце) он отвергает: «bad size (00000000000)».
+Символические ссылки (bin/sh) уходят в архив ссылками.
 
-    python3 tools/pack.py <каталог с etc и share> <архив.tar.gz>
+    python3 tools/pack.py <каталог с bin, etc и share> <архив.tar.gz>
 """
 import os
 import sys
@@ -18,7 +19,7 @@ def as_root(info):
 
 def main(src, dst):
     with tarfile.open(dst, 'w:gz', format=tarfile.GNU_FORMAT) as tar:
-        for top in ('etc', 'share'):
+        for top in ('bin', 'etc', 'share'):
             tar.add(os.path.join(src, top), arcname=top, filter=as_root)
 
 

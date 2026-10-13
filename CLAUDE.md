@@ -51,10 +51,16 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
   `{"interface":{"wireguard":{"import":{"import": base64(.conf), "name": "", "filename": "…"}}}}`, в ответе
   `created` и `intersects`; затем `{"interface":{"name": …, "description": …}}`, `{…, "up": true}` и сохранение.
   Связь — `show interface` → `wireguard.peer[].online`. Версию AWG выбирает `awgProfile` по `show version`.
-- `router/S99hostsgen-ui` — init-скрипт для `/bin/sh` прошивки: определяет процессор по заголовку ELF
-  самого `/bin/sh` и запускает `bin/hostsgen-ui.{mipsel,mips,aarch64}`.
-- `router/initrc` — сценарий запуска OPKG для накопителя без Entware: KeeneticOS по умолчанию вызывает
-  `/opt/etc/initrc start|stop`, он запускает `/opt/etc/init.d/S*`. С Entware вызывается его `rc.unslung`.
+- Архив — по одному на процессор (`hostsgen-ui-{mipsel,mips,aarch64}.tar.gz`): кроме сборок своего процессора,
+  в нём ссылка `bin/sh` → `/opt/share/hostsgen-ui/bin/hostsgen-ui.<процессор>`. Всё из `/opt` KeeneticOS
+  запускает только через `/opt/bin/sh` (см. грабли), а без Entware её больше некому дать. Вызванный как `sh`,
+  помощник работает в `sh_mode`: есть Entware (`/opt/bin/busybox`) — возвращает его ссылку `sh → busybox`
+  и передаёт ему управление с теми же аргументами; нет — сам выполняет `sh /opt/etc/initrc start|stop`
+  (и `sh …/S99hostsgen-ui …`), то есть встраивает или снимает модуль.
+- `router/S99hostsgen-ui` и `router/initrc` нужны роутерам с Entware: прошивка зовёт `/opt/etc/initrc start|stop`
+  его оболочкой, `initrc` запускает `/opt/etc/init.d/S*`, а `S99` — сборку под процессор (по заголовку ELF
+  `/bin/sh`). После переподключения накопителя прошивка сбрасывает сценарий запуска на `/opt/etc/initrc`,
+  так что у пользователей Entware наш `initrc` заменяет `rc.unslung`.
 - Маршруты добавляются так же, как это делает сам интерфейс: `POST /rci/` с пачками
   `{"ip":{"route":{network, mask | host, interface, auto, comment}}}` (для политики доступа —
   `{"ip":{"policy":{"name": "Policy1", "route": {…}}}}`), затем `{"system":{"configuration":{"save":{}}}}`.
@@ -71,6 +77,8 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
 - Путь `/opt/share/hostsgen-ui/hostsgen-ui` — это `SELF` в `helper/hostsgen-ui.c` и `HELPER` в
   `web/common.js`; `ADDON` в помощнике — куда `build.sh`/`deploy.sh` кладут склеенный `addon.js`,
   `DBCLIENT` и `VPS_SCRIPT` — куда кладут `bin/dbclient.<arch>` и `vps-setup.sh`. Менять вместе.
+- Ссылка `bin/sh` в архиве ведёт на `HOME/bin/hostsgen-ui.<процессор>` (`build.sh`), а `restore_entware_sh`
+  узнаёт свою ссылку по префиксу `HOME/` и вызов в роли оболочки — по имени `sh`/`-sh` в `argv[0]` (`main`).
 - `resolve` печатает строку на домен: «домен ip1 ip2 …» или «домен -». `addon.js` берёт только строки,
   начинающиеся с домена из своей пачки (ndm дописывает в вывод `exec` «process terminated»). Пачка
   `HOSTS_PER_EXEC` (30) должна укладываться в `MAX_HOSTS` помощника (64).
@@ -91,11 +99,11 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
 ## Сборка, тесты, выкладка
 
 ```bash
-./build.sh                                              # тесты + помощник и dbclient под три процессора + dist/install/hostsgen-ui.tar.gz
+./build.sh                                              # тесты + помощник и dbclient под три процессора + dist/install/hostsgen-ui-<процессор>.tar.gz
 node --test tests/*.test.js                             # только тесты веб-модулей и синтаксиса vps-setup.sh
 node --test --test-name-pattern='parseHar' tests/addon.test.js   # один тест
 node --check web/vps.js                                 # синтаксис модуля
-./deploy.sh                                             # выложить dist/ на роутер с Entware (SSH) и перевстроить модуль
+./deploy.sh                                             # выложить архив ARCH (mipsel по умолчанию) на роутер с Entware (SSH)
 ./deploy.sh status                                      # встроен ли модуль
 ./deploy.sh uninstall                                   # вернуть родной интерфейс, удалить файлы
 ```
@@ -109,8 +117,9 @@ dbclient собирается из dropbear (версия и SHA-256 — в `bui
 дальше `GET /rci/exec`, пока `continued`.
 
 Выпуск: поднять `VERSION` в `helper/hostsgen-ui.c`, `./build.sh`, закоммитить и запушить, затем
-`gh release create vX.Y.Z dist/install/hostsgen-ui.tar.gz --repo PavelDemyanov/keenetic-hostsgen-ui`.
-Кнопка «Скачать» в README ведёт на `releases/latest/download/hostsgen-ui.tar.gz` — имя файла не менять.
+`gh release create vX.Y.Z dist/install/hostsgen-ui-*.tar.gz --repo PavelDemyanov/keenetic-hostsgen-ui`.
+Ссылки «Скачать» в README ведут на `releases/latest/download/hostsgen-ui-{mipsel,aarch64,mips}.tar.gz` —
+имена файлов не менять.
 
 `build.sh` нужен `zig` в PATH (проверено на 0.17.0), плюс `node` и `python3`. Zig из Homebrew тянет
 отдельные LLVM и LLD, а ziglang.org и ghcr.io (бутылки Homebrew) из российских сетей душат; официальный архив `zig-aarch64-macos-<версия>.tar.xz` быстро отдаёт зеркало fs.liujiacai.net/zigbuilds
@@ -155,5 +164,14 @@ dbclient собирается из dropbear (версия и SHA-256 — в `bui
   а уже настроенный на 3.1 сервер `vps-setup.sh` для такого роутера не трогает (ошибка с советом обновиться).
 - Пароль VPS и пароль роутера Claude не вводит: финальную проверку окна делает пользователь, а для отладки
   `vps-setup.sh` без роутера нужен вход на тестовый VPS по ключу.
-- Проверено только на mipsel (Giga KN-1011, KeeneticOS 5.2); сборки mips и aarch64 на железе не запускались.
-  VPS проверен один: Ubuntu 22.04 x86_64 (KVM).
+- Прошивка (ndm) запускает `initrc` и хуки `/opt/etc/ndm/*.d` только как `/opt/bin/sh …`, а `/bin/sh` прошивки —
+  не оболочка, а «NDM Shell Wrapper»: без аргументов открывает CLI, а скрипты передаёт `/opt/bin/sh`, требуя,
+  чтобы та лежала в `/opt` («Bad interpreter …: origin is not /opt»). Без Entware в журнале «"/opt/bin/sh"
+  executable not found», с архивом не того процессора — «exec format error»: так и проверять выбор архива.
+- `npkg` (распаковщик прошивки, `npkg -i архив -o корень` — удобно проверять в `/tmp`) ссылку из архива ставит
+  вместо существующей, а обычный файл пишет сквозь существующую ссылку. Поэтому `bin/sh` в архиве — только
+  ссылка: файл на этом месте у пользователя Entware затёр бы его `busybox`.
+- Название модели процессор не определяет: Giga KN-1011 — mipsel, Giga KN-1012 — aarch64. Выбор — по коду KN-…
+  (в журнале загрузки: «Machine model: Keenetic KN-1012»).
+- Проверено на KeeneticOS 5.2: Giga KN-1011 (mipsel, с Entware) и Giga KN-1012 (aarch64, без Entware —
+  установка архивом целиком). Сборка mips на железе не запускалась. VPS проверен один: Ubuntu 22.04 x86_64 (KVM).

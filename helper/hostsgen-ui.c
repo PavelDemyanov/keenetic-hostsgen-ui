@@ -41,12 +41,14 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.1.0"
+#define VERSION "1.1.1"
 #define HOME "/opt/share/hostsgen-ui"
 #define ADDON HOME "/addon.js"
 #define SELF HOME "/hostsgen-ui"
 #define WWW "/usr/share/htdocs_"
 #define RUN "/tmp/hostsgen-ui"
+#define OPT_SH "/opt/bin/sh"                // ею прошивка запускает initrc и скрипты из /opt
+#define ENTWARE_BUSYBOX "/opt/bin/busybox"  // куда ведёт /opt/bin/sh у Entware
 
 #define MAX_HOSTS 64 // за один вызов resolve; веб-модуль шлёт по 30
 #define MAX_IPS 32
@@ -218,7 +220,30 @@ static int patch_page(const char *page, const char *addon, size_t addon_len) {
 	return 0;
 }
 
+/* Прошивка запускает initrc и любые скрипты из /opt только через /opt/bin/sh, причём только если та
+ * лежит в /opt; обычно её привозит Entware. Поэтому наш архив кладёт ссылку /opt/bin/sh на эту
+ * программу (сборку под свой процессор). Если на накопителе Entware, распаковка подменила его ссылку
+ * sh → busybox — возвращаем её (атомарно, через rename), чтобы его оболочка не изменилась. */
+static void restore_entware_sh(void) {
+	char target[256];
+	ssize_t n = readlink(OPT_SH, target, sizeof target - 1);
+	if (n <= 0) return;
+	target[n] = 0;
+	if (strncmp(target, HOME "/", strlen(HOME "/")) != 0 || access(ENTWARE_BUSYBOX, X_OK) != 0) return;
+	// только в журнал: в режиме /opt/bin/sh наш вывод попал бы в вывод чужой команды
+	char text[256];
+	unlink(OPT_SH ".hostsgen-ui");
+	if (symlink(ENTWARE_BUSYBOX, OPT_SH ".hostsgen-ui") == 0 && rename(OPT_SH ".hostsgen-ui", OPT_SH) == 0) {
+		snprintf(text, sizeof text, "Entware: %s снова ведёт на %s", OPT_SH, ENTWARE_BUSYBOX);
+		log_line(LOG_INFO, text);
+	} else {
+		snprintf(text, sizeof text, "Entware: не удалось вернуть %s → %s: %s", OPT_SH, ENTWARE_BUSYBOX, strerror(errno));
+		log_line(LOG_ERR, text);
+	}
+}
+
 static int cmd_start(void) {
+	restore_entware_sh();
 	install_self();
 	size_t len;
 	char *addon = read_file(ADDON, &len);
@@ -707,17 +732,62 @@ static void load_timezone(void) {
 	tzset();
 }
 
-int main(int argc, char **argv) {
-	const char *cmd = argc > 1 ? argv[1] : "";
-	load_timezone();
-	// start/stop/restart/status приходят и от rc.unslung Entware, и от initrc из архива
-	if (strcmp(cmd, "start") == 0) return cmd_start();
-	if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "kill") == 0) return cmd_stop();
-	if (strcmp(cmd, "restart") == 0) {
+/* start/stop/restart/status — от rc.unslung Entware, от initrc из архива и от прошивки через /opt/bin/sh */
+static int run_action(const char *action) {
+	if (strcmp(action, "start") == 0) return cmd_start();
+	if (strcmp(action, "stop") == 0 || strcmp(action, "kill") == 0) return cmd_stop();
+	if (strcmp(action, "restart") == 0) {
 		cmd_stop();
 		return cmd_start();
 	}
-	if (strcmp(cmd, "status") == 0 || strcmp(cmd, "check") == 0) return cmd_status();
+	if (strcmp(action, "status") == 0 || strcmp(action, "check") == 0) return cmd_status();
+	return -1;
+}
+
+/* Программа, вызванная как /opt/bin/sh (ссылка из архива, см. restore_entware_sh).
+ * С Entware — передаём всё его busybox: он выберет ash по argv[0] («sh» или «-sh» у входа по SSH).
+ * Без Entware настоящей оболочки на роутере нет, и прошивка зовёт нас только так:
+ * «sh /opt/etc/initrc start|stop», а обёртка /bin/sh для нашего S99 — «sh …/S99hostsgen-ui start|stop».
+ * Это и выполняем; чужие скрипты (например, хуки из /opt/etc/ndm/) исполнять нечем — пропускаем. */
+static int sh_mode(int argc, char **argv) {
+	if (access(ENTWARE_BUSYBOX, X_OK) == 0) {
+		restore_entware_sh();
+		execv(ENTWARE_BUSYBOX, argv);
+		fprintf(stderr, "hostsgen-ui: не удалось запустить %s: %s\n", ENTWARE_BUSYBOX, strerror(errno));
+		return 127;
+	}
+	const char *script = argc > 1 ? argv[1] : "", *action = argc > 2 ? argv[2] : "start";
+	char line[256];
+	if (strcmp(script, "-c") == 0 && argc > 2) { // та же команда строкой: «sh -c "/opt/etc/initrc start"»
+		snprintf(line, sizeof line, "%s", argv[2]);
+		char *space = strchr(line, ' ');
+		action = "start";
+		if (space) {
+			*space = 0;
+			for (action = space + 1; *action == ' '; action++) {
+			}
+		}
+		script = line;
+	}
+	const char *base = strrchr(script, '/');
+	base = base ? base + 1 : script;
+	if (strcmp(base, "initrc") == 0 || strcmp(base, "S99hostsgen-ui") == 0) {
+		int rc = run_action(*action ? action : "start");
+		return rc < 0 ? 0 : rc;
+	}
+	if (script[0] == '/') return 0;
+	fprintf(stderr, "hostsgen-ui: на накопителе нет оболочки — для скриптов установите Entware\n");
+	return 127;
+}
+
+int main(int argc, char **argv) {
+	const char *cmd = argc > 1 ? argv[1] : "";
+	const char *name = strrchr(argv[0], '/');
+	name = name ? name + 1 : argv[0];
+	load_timezone();
+	if (strcmp(name, "sh") == 0 || strcmp(name, "-sh") == 0) return sh_mode(argc, argv);
+	int rc = run_action(cmd);
+	if (rc >= 0) return rc;
 	if (strcmp(cmd, "resolve") == 0) return cmd_resolve(argc - 2, argv + 2);
 	if (strcmp(cmd, "vps-pad") == 0) return cmd_vps_pad();
 	if (strcmp(cmd, "vps-start") == 0) return cmd_vps_start(argc - 2, argv + 2);
