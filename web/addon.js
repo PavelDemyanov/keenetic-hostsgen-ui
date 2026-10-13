@@ -2,14 +2,13 @@
  * hostsgen-ui — кнопка «Добавить списком» на странице «Маршрутизация → IPv4-маршруты» KeeneticOS.
  * Домены, IP-адреса, подсети или HAR-файл → маска → маршруты сразу добавляются через RCI.
  *
- * Скрипт встраивается inline в index.html веб-интерфейса (router/S99hostsgen-ui), поэтому
- * в коде нельзя писать закрывающий тег script и открытие HTML-комментария — tests это проверяют.
+ * Скрипт встраивается inline в index.html веб-интерфейса (router/S99hostsgen-ui) вместе с common.js,
+ * поэтому в коде нельзя писать закрывающий тег script и открытие HTML-комментария — tests это проверяют.
  * Домены распознаёт DNS самого роутера: helper/hostsgen-ui.c (resolve), вызывается RCI-командой exec.
  */
 (() => {
   'use strict';
 
-  const HELPER = '/opt/share/hostsgen-ui/hostsgen-ui'; // helper/hostsgen-ui.c, кладёт себя сюда при start
   const HOSTS_PER_EXEC = 30; // доменов за один вызов hostsgen-ui resolve
   const ROUTES_PER_REQUEST = 50; // команд ip route в одном POST /rci/
   const MANY_ROUTES = 1000; // дальше веб-интерфейс роутера заметно тормозит
@@ -183,57 +182,70 @@
     return { items: kept, reserved };
   }
 
+  // ---------- смена интерфейса у выделенных маршрутов ----------
+
+  /** Адрес назначения маршрута из RCI так, как его показывает таблица: «сеть/биты» или адрес узла без /32. */
+  function routeDestination(route) {
+    if (route.host) return route.host;
+    const bits = maskToBits(route.mask || '');
+    return route.network && bits !== null ? `${route.network}/${bits}` : '';
+  }
+
+  /**
+   * Выделенные строки таблицы ({ destination, gateway, iface } — как в ячейках) → маршруты из RCI.
+   * label(id) — подписи интерфейса, которые может показать таблица (описание и имя).
+   * Если подпись не совпала, но маршрут с таким назначением и шлюзом один, берём его.
+   */
+  function matchRows(rows, routes, label) {
+    const pool = routes.map((route) => ({ route, dest: routeDestination(route), gateway: route.gateway || '', labels: label(route.interface || '') }));
+    const found = [];
+    const missing = [];
+    for (const row of rows) {
+      const same = pool.filter((p) => p.dest === row.destination && p.gateway === row.gateway);
+      const pick = same.find((p) => p.labels.includes(row.iface)) || (same.length === 1 ? same[0] : null);
+      if (!pick) {
+        missing.push(row.destination);
+        continue;
+      }
+      pool.splice(pool.indexOf(pick), 1);
+      found.push(pick.route);
+    }
+    return { found, missing };
+  }
+
+  /**
+   * Команды RCI переноса маршрута на интерфейс target — как в штатном редакторе маршрута: удалить
+   * старый по index и добавить такой же, но через другой интерфейс. Шлюз старого интерфейса не переносим.
+   * policy — имя политики доступа ('' — политика по умолчанию).
+   */
+  function moveCommands(route, target, policy) {
+    const add = { ...route, interface: target };
+    delete add.index;
+    delete add.gateway;
+    return [policyRoute({ index: route.index, no: true }, policy), policyRoute(add, policy)];
+  }
+
+  /** Маршрут политики доступа пишется в ip policy, как это делает штатный редактор маршрутов. */
+  const policyRoute = (body, policy) => (policy ? { ip: { policy: { name: policy, route: body } } } : { ip: { route: body } });
+
   if (typeof window === 'undefined') {
     // node --test: чистые функции без DOM
-    module.exports = { parseInput, parseHar, parseExisting, buildPlan, maskToBits, ipToInt, intToIp, isReserved };
+    module.exports = {
+      parseInput, parseHar, parseExisting, buildPlan, maskToBits, ipToInt, intToIp, isReserved,
+      routeDestination, matchRows, moveCommands,
+    };
     return;
   }
 
   // ---------- RCI ----------
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  async function rciFetch(path, init) {
-    const res = await fetch(`/rci/${path}`, { credentials: 'same-origin', ...init });
-    if (res.status === 401) throw new Error('сессия истекла — обновите страницу и войдите заново');
-    if (!res.ok) throw new Error(`роутер ответил ${res.status} на /rci/${path}`);
-    return res.json();
-  }
-
-  const rciPost = (path, body) =>
-    rciFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-
-  /** Ошибки из ответа RCI на любой глубине: у маршрутов политик статус лежит внутри ip.policy. */
-  function errorsOf(node) {
-    if (!node || typeof node !== 'object') return [];
-    const own = Array.isArray(node.status) ? node.status.filter((s) => s && s.status === 'error').map((s) => s.message) : [];
-    return own.concat(...Object.entries(node).map(([key, value]) => (key === 'status' ? [] : errorsOf(value))));
-  }
-
-  /** exec отвечает частями: POST запускает процесс, GET забирает очередной кусок, пока в ответе есть continued. */
-  async function execResolver(hosts, cancel) {
-    let reply = await rciPost('exec', { path: HELPER, arg1: 'resolve', arg2: hosts.join(',') });
-    const lines = [];
-    for (;;) {
-      const errors = errorsOf(reply);
-      if (errors.length) throw new Error(`hostsgen-ui на роутере: ${errors.join('; ')} — переустановите модуль`);
-      if (Array.isArray(reply.message)) lines.push(...reply.message);
-      else if (typeof reply.message === 'string') lines.push(reply.message);
-      if (!reply.continued) return lines;
-      if (cancel.cancelled) {
-        fetch('/rci/exec', { method: 'DELETE', credentials: 'same-origin' }).catch(() => {});
-        throw new Error('отменено');
-      }
-      await sleep(250);
-      reply = await rciFetch('exec');
-    }
-  }
+  const { plural, rciFetch, rciPost, errorsOf, execHelper, openOverlay, cloneButton, watchPage } = window.hostsgenUi;
 
   async function resolveHosts(hosts, onProgress, cancel) {
     const out = new Map();
     for (let i = 0; i < hosts.length; i += HOSTS_PER_EXEC) {
       const chunk = hosts.slice(i, i + HOSTS_PER_EXEC);
-      for (const line of await execResolver(chunk, cancel)) {
+      for (const line of await execHelper(['resolve', chunk.join(',')], cancel)) {
         const [host, ...rest] = String(line).trim().split(/\s+/);
         if (chunk.includes(host)) out.set(host, rest.filter(isIPv4));
       }
@@ -253,11 +265,7 @@
     return body;
   }
 
-  // Маршрут политики доступа пишется в ip policy, как это делает штатный редактор маршрутов.
-  const routeCommand = (item, options) =>
-    options.policy
-      ? { ip: { policy: { name: options.policy, route: routeBody(item, options) } } }
-      : { ip: { route: routeBody(item, options) } };
+  const routeCommand = (item, options) => policyRoute(routeBody(item, options), options.policy);
 
   async function addRoutes(items, options) {
     let added = 0;
@@ -287,12 +295,17 @@
     for (const [id, policy] of Object.entries(policies || {})) {
       routesByPolicy.set(id, Array.isArray(policy && policy.route) ? policy.route : []);
     }
+    const all = Object.values(interfaces || {}).filter((i) => i && i.id);
     return {
       routesByPolicy,
       policies: Object.entries(policies || {}).map(([id, policy]) => ({ id, label: (policy && policy.description) || id })),
-      ifaces: Object.values(interfaces || {}).filter((i) => i && i.id && (i.global || VPN_TYPES.test(i.type || ''))),
+      ifaces: all.filter((i) => i.global || VPN_TYPES.test(i.type || '')),
+      names: new Map(all.map((i) => [i.id, i.description || i.id])), // подписи всех интерфейсов, как в таблицах
     };
   }
+
+  // «Описание (Wireguard0)» и пометка, если у подключения нет связи
+  const ifaceTitle = (i) => (i.description ? `${i.description} (${i.id})` : i.id) + (i.link && i.link !== 'up' ? ' — нет связи' : '');
 
   // ---------- настройки ----------
 
@@ -313,51 +326,6 @@
   }
 
   // ---------- интерфейс ----------
-
-  const plural = (n, one, few, many) => {
-    const d = n % 10;
-    const dd = n % 100;
-    if (d === 1 && dd !== 11) return one;
-    if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return few;
-    return many;
-  };
-
-  const STYLE = `
-.hg-overlay{position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px}
-.hg-dialog{background:var(--background,#1b2434);color:var(--primary-text,#c2c2c2);border:1px solid var(--table-border,#4d545f);border-radius:4px;width:min(760px,100%);max-height:calc(100vh - 32px);display:flex;flex-direction:column;font:14px/22px Roboto,sans-serif;box-shadow:0 8px 32px rgba(0,0,0,.4)}
-.hg-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 24px 4px}
-.hg-title{margin:0;font-size:22px;line-height:28px;font-weight:700}
-.hg-x{background:none;border:0;color:var(--text-gray,#949b9f);font-size:26px;line-height:1;cursor:pointer;padding:4px}
-.hg-x:hover{color:var(--primary-color,#0097dc)}
-.hg-body{padding:8px 24px 4px;overflow:auto}
-.hg-hint{margin:0 0 8px;color:var(--text-gray,#949b9f)}
-.hg-text{display:block;width:100%;min-height:150px;resize:vertical;box-sizing:border-box;background:transparent;color:inherit;border:1px solid var(--table-border,#4d545f);border-radius:4px;padding:8px 10px;font:13px/20px ui-monospace,Menlo,Consolas,monospace}
-.hg-text:focus,.hg-input:focus,.hg-select:focus{outline:none;border-color:var(--primary-color,#0097dc)}
-.hg-text.hg-drop{border-style:dashed;border-color:var(--primary-color,#0097dc)}
-.hg-row{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:flex-end;margin-top:12px}
-.hg-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:200px}
-.hg-label{color:var(--text-gray,#949b9f);font-size:12px;line-height:16px}
-.hg-input,.hg-select{height:32px;box-sizing:border-box;background:var(--background,#1b2434);color:inherit;border:1px solid var(--table-border,#4d545f);border-radius:4px;padding:0 8px;font:inherit}
-.hg-check{display:flex;align-items:center;gap:8px;height:32px;cursor:pointer;white-space:nowrap}
-.hg-btn{height:32px;padding:0 16px;border-radius:4px;font:inherit;cursor:pointer;border:1px solid var(--primary-color,#0097dc);background:transparent;color:var(--primary-color,#0097dc)}
-.hg-btn--primary{background:var(--primary-color,#0097dc);color:#fff}
-.hg-btn:disabled{opacity:.45;cursor:default}
-.hg-chip{display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:0 4px 0 10px;border:1px solid var(--table-border,#4d545f);border-radius:14px;font-size:13px}
-.hg-chip button{background:none;border:0;color:inherit;cursor:pointer;font-size:16px;padding:0 6px}
-.hg-status{min-height:22px;margin-top:10px;color:var(--text-gray,#949b9f)}
-.hg-status--error{color:var(--error,#de3d3d)}
-.hg-summary{margin:4px 0 8px}
-.hg-notes{margin:8px 0 0;padding-left:18px;color:var(--text-gray,#949b9f);font-size:13px}
-.hg-tablewrap{max-height:260px;overflow:auto;border:1px solid var(--table-border,#4d545f);border-radius:4px}
-.hg-table{width:100%;border-collapse:collapse;font-size:13px;line-height:20px}
-.hg-table th,.hg-table td{text-align:left;padding:4px 10px;border-bottom:1px solid var(--table-border,#4d545f);vertical-align:top}
-.hg-table th{position:sticky;top:0;background:var(--background,#1b2434);color:var(--text-gray,#949b9f);font-weight:400}
-.hg-table tr:last-child td{border-bottom:0}
-.hg-net{white-space:nowrap;font-family:ui-monospace,Menlo,Consolas,monospace}
-.hg-muted{color:var(--text-gray,#949b9f)}
-.hg-foot{display:flex;justify-content:flex-end;gap:12px;padding:12px 24px 20px}
-@media (max-width:600px){.hg-head,.hg-body,.hg-foot{padding-left:16px;padding-right:16px}.hg-title{font-size:18px}}
-`;
 
   const TEMPLATE = `
 <div class="hg-dialog" role="dialog" aria-modal="true" aria-labelledby="hg-title">
@@ -401,24 +369,7 @@
   </div>
 </div>`;
 
-  function injectStyle() {
-    if (document.getElementById('hostsgen-ui-style')) return;
-    const style = document.createElement('style');
-    style.id = 'hostsgen-ui-style';
-    style.textContent = STYLE;
-    document.head.append(style);
-  }
-
   function openDialog() {
-    if (document.querySelector('.hg-overlay')) return;
-    injectStyle();
-    const overlay = document.createElement('div');
-    overlay.className = 'hg-overlay';
-    overlay.innerHTML = TEMPLATE;
-    document.body.append(overlay);
-    const $ = (role) => overlay.querySelector(`[data-role="${role}"]`);
-
-    const prefs = loadPrefs();
     const state = {
       ctx: null,
       har: null, // { name, serverIps: Map(домен → Set(ip)), hosts }
@@ -428,7 +379,16 @@
       busy: false,
       cancel: { cancelled: false },
     };
+    const dialog = openOverlay(TEMPLATE, {
+      canClose: () => !state.busy,
+      onClose: () => {
+        state.cancel.cancelled = true;
+      },
+    });
+    if (!dialog) return;
+    const { overlay, $, close } = dialog;
 
+    const prefs = loadPrefs();
     for (const m of MASKS) $('mask').append(new Option(m.label, String(m.bits)));
     $('mask').value = String(MASKS.some((m) => m.bits === prefs.bits) ? prefs.bits : 16);
     $('auto').checked = prefs.auto !== false;
@@ -438,25 +398,6 @@
       $('status').classList.toggle('hg-status--error', isError);
     };
 
-    // Сервис горячих клавиш KeeneticOS слушает keydown на document в фазе перехвата и, пока считает
-    // открытым свой выпадающий список, отменяет любые нажатия — вместе с набором и Cmd+V в нашем поле.
-    // Поэтому клавиши и буфер обмена из диалога останавливаем раньше, на window: до KeeneticOS они
-    // не доходят, а ввод и вставка (действие по умолчанию) работают как обычно.
-    const ISOLATED = ['keydown', 'keypress', 'keyup', 'paste', 'cut', 'copy'];
-    const isolate = (e) => {
-      if (e.type === 'keydown' && e.key === 'Escape' && !state.busy) {
-        e.stopPropagation();
-        close();
-      } else if (overlay.contains(e.target)) {
-        e.stopPropagation();
-      }
-    };
-    const close = () => {
-      state.cancel.cancelled = true;
-      ISOLATED.forEach((type) => window.removeEventListener(type, isolate, true));
-      overlay.remove();
-    };
-    ISOLATED.forEach((type) => window.addEventListener(type, isolate, true));
     $('close').addEventListener('click', close);
     $('cancel').addEventListener('click', close);
 
@@ -509,11 +450,7 @@
         for (const r of list) if (r.interface) counts.set(r.interface, (counts.get(r.interface) || 0) + 1);
       }
       const sorted = [...state.ctx.ifaces].sort((a, b) => (counts.get(b.id) || 0) - (counts.get(a.id) || 0));
-      for (const i of sorted) {
-        const name = i.description ? `${i.description} (${i.id})` : i.id;
-        const down = i.link && i.link !== 'up' ? ' — нет связи' : '';
-        $('iface').append(new Option(name + down, i.id));
-      }
+      for (const i of sorted) $('iface').append(new Option(ifaceTitle(i), i.id));
       if (sorted.some((i) => i.id === prefs.iface)) $('iface').value = prefs.iface;
 
       $('policy').append(new Option('Политика по умолчанию', ''));
@@ -711,9 +648,157 @@
     text.focus();
   }
 
-  // ---------- кнопка на странице ----------
+  // ---------- окно «Сменить интерфейс» ----------
 
-  // Кнопка — копия штатной «Загрузить»: так она получает стили Angular-компонента без своих CSS.
+  const MOVE_TEMPLATE = `
+<div class="hg-dialog" role="dialog" aria-modal="true" aria-labelledby="hm-title">
+  <div class="hg-head">
+    <h2 class="hg-title" id="hm-title">Сменить интерфейс у маршрутов</h2>
+    <button type="button" class="hg-x" data-role="close" aria-label="Закрыть">×</button>
+  </div>
+  <div class="hg-body">
+    <p class="hg-summary" data-role="summary">Читаю маршруты роутера…</p>
+    <div class="hg-row">
+      <label class="hg-field"><span class="hg-label">Новый интерфейс</span><select class="hg-select" data-role="iface"></select></label>
+    </div>
+    <ul class="hg-notes" data-role="notes">
+      <li>Поменяется только интерфейс: адреса, описание и «Добавлять автоматически» останутся прежними.</li>
+    </ul>
+    <div class="hg-status" data-role="status" aria-live="polite"></div>
+  </div>
+  <div class="hg-foot">
+    <button type="button" class="hg-btn" data-role="cancel">Отмена</button>
+    <button type="button" class="hg-btn hg-btn--primary" data-role="apply" disabled>Перенести</button>
+  </div>
+</div>`;
+
+  /** Выделенные строки таблицы пользовательских маршрутов: колонки «выбор, включено, назначение, шлюз, интерфейс, …». */
+  function selectedRows() {
+    const table = document.querySelector('.user-routes-table table.ndw-table');
+    if (!table) return [];
+    return [...table.querySelectorAll('tbody tr')]
+      .filter((tr) => tr.querySelector('input.ndw-checkbox__checkbox__input:checked'))
+      .map((tr) => {
+        const cell = (i) => (tr.children[i] ? tr.children[i].textContent.trim() : '');
+        return { destination: cell(2), gateway: cell(3), iface: cell(4) };
+      });
+  }
+
+  /** Политика над таблицей маршрутов: '' — политика по умолчанию (в списке она permit). */
+  function selectedPolicy() {
+    const select = [...document.querySelectorAll('select')].find((s) => [...s.options].some((o) => o.value === 'permit'));
+    return select && select.value !== 'permit' ? select.value : '';
+  }
+
+  function openMoveDialog() {
+    const rows = selectedRows(); // до открытия окна: потом таблица под ним может перерисоваться
+    const policy = selectedPolicy();
+    const state = { busy: false, routes: [], ctx: null };
+    const dialog = openOverlay(MOVE_TEMPLATE, { canClose: () => !state.busy });
+    if (!dialog) return;
+    const { overlay, $, close } = dialog;
+    $('close').addEventListener('click', close);
+    $('cancel').addEventListener('click', close);
+
+    const setStatus = (text, isError = false) => {
+      $('status').textContent = text;
+      $('status').classList.toggle('hg-status--error', isError);
+    };
+    const run = async (task) => {
+      if (state.busy) return;
+      state.busy = true;
+      const controls = [...overlay.querySelectorAll('button, select')].filter((el) => !['cancel', 'close'].includes(el.dataset.role));
+      controls.forEach((el) => {
+        el.disabled = true;
+      });
+      try {
+        await task();
+      } catch (err) {
+        setStatus(`Ошибка: ${err.message}`, true);
+      } finally {
+        state.busy = false;
+        controls.forEach((el) => {
+          el.disabled = false;
+        });
+        $('apply').disabled = !state.routes.length;
+      }
+    };
+    const name = (id) => (state.ctx && state.ctx.names.get(id)) || id || 'без интерфейса';
+
+    run(async () => {
+      if (!rows.length) throw new Error('отметьте маршруты галочками в таблице');
+      state.ctx = await loadContext();
+      const labels = (id) => [state.ctx.names.get(id), id].filter(Boolean);
+      const { found, missing } = matchRows(rows, state.ctx.routesByPolicy.get(policy) || [], labels);
+      state.routes = found;
+
+      const counts = new Map();
+      for (const r of found) counts.set(r.interface || '', (counts.get(r.interface || '') || 0) + 1);
+      const now = [...counts].sort((a, b) => b[1] - a[1]);
+      const n = found.length;
+      $('summary').textContent =
+        `${plural(n, 'Выделен', 'Выделено', 'Выделено')} ${n} ${plural(n, 'маршрут', 'маршрута', 'маршрутов')}` +
+        (now.length ? `, сейчас ${n === 1 ? 'он идёт' : 'они идут'} через ${now.map(([id, k]) => `${name(id)} (${k})`).join(', ')}.` : '.');
+      if (missing.length) {
+        const li = document.createElement('li');
+        li.textContent = `Не нашёл в настройках роутера и не трону: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '…' : ''}`;
+        $('notes').append(li);
+      }
+      for (const i of state.ctx.ifaces) $('iface').append(new Option(ifaceTitle(i), i.id));
+      // по умолчанию — другой VPN: маршруты переносят с одного туннеля на другой, а не на провайдера
+      const free = state.ctx.ifaces.filter((i) => !counts.has(i.id));
+      const other = free.find((i) => VPN_TYPES.test(i.type || '')) || free[0];
+      if (other) $('iface').value = other.id;
+      $('apply').textContent = `Перенести ${found.length} ${plural(found.length, 'маршрут', 'маршрута', 'маршрутов')}`;
+    });
+
+    $('apply').addEventListener('click', () =>
+      run(async () => {
+        const target = $('iface').value;
+        const todo = state.routes.filter((r) => r.interface !== target);
+        if (!todo.length) {
+          setStatus(`Выделенные маршруты уже идут через ${name(target)}`);
+          return;
+        }
+        let moved = 0;
+        const failed = [];
+        for (let i = 0; i < todo.length; i += ROUTES_PER_REQUEST) {
+          const chunk = todo.slice(i, i + ROUTES_PER_REQUEST);
+          const replies = await rciPost('', chunk.flatMap((route) => moveCommands(route, target, policy)));
+          // старый маршрут удалён, а новый не добавился — возвращаем старый, чтобы адреса не ушли мимо VPN
+          const restore = [];
+          chunk.forEach((route, k) => {
+            const removeErrors = errorsOf(replies[2 * k]);
+            const addErrors = errorsOf(replies[2 * k + 1]);
+            if (!removeErrors.length && !addErrors.length) {
+              moved++;
+              return;
+            }
+            failed.push(`${routeDestination(route)}: ${removeErrors.concat(addErrors).join('; ')}`);
+            if (addErrors.length && !removeErrors.length) {
+              const back = { ...route };
+              delete back.index;
+              restore.push(policyRoute(back, policy));
+            }
+          });
+          if (restore.length) await rciPost('', restore);
+          setStatus(`Переношу маршруты: ${Math.min(i + ROUTES_PER_REQUEST, todo.length)} из ${todo.length}…`);
+        }
+        await rciPost('', [{ system: { configuration: { save: {} } } }]);
+        if (failed.length) {
+          setStatus(`Перенесено ${moved}, не удалось ${failed.length}: ${failed.slice(0, 3).join('; ')}`, true);
+          return;
+        }
+        setStatus(`Перенесено маршрутов на ${name(target)}: ${moved}. Обновляю таблицу…`);
+        state.routes = [];
+        setTimeout(() => location.reload(), 900);
+      }),
+    );
+  }
+
+  // ---------- кнопки на странице ----------
+
+  // «Добавить списком» — копия штатной «Загрузить» рядом с «Добавить».
   function injectButton() {
     if (!/\/staticRoutes\/ipv4\/?$/.test(location.pathname)) return;
     const row = document.querySelector('.user-routes-table__buttons-row');
@@ -721,31 +806,40 @@
     const buttons = row.querySelectorAll('ndw-button');
     const template = buttons[1] || buttons[0];
     if (!template) return;
-    const host = template.cloneNode(true);
-    host.setAttribute('data-hostsgen-ui', '');
-    const button = host.querySelector('button');
-    if (!button) return;
-    button.disabled = false;
-    button.title = 'Домены, IP-адреса или HAR-файл → маршруты';
-    const label = host.querySelector('.ndw-button__label');
-    if (label) label.textContent = ' Добавить списком';
-    const icon = host.querySelector('use');
-    if (icon) icon.setAttribute('href', './assets/sprite/sprite.svg#list');
-    button.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      openDialog();
+    const host = cloneButton(template, {
+      marker: 'data-hostsgen-ui',
+      label: 'Добавить списком',
+      icon: 'list',
+      title: 'Домены, IP-адреса или HAR-файл → маршруты',
+      onClick: openDialog,
     });
-    buttons[0].after(host);
+    if (host) buttons[0].after(host);
   }
 
-  let scheduled = false;
-  new MutationObserver(() => {
-    if (scheduled) return;
-    scheduled = true;
-    setTimeout(() => {
-      scheduled = false;
-      injectButton();
-    }, 150);
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  // «Сменить интерфейс» — копия штатной «Удалить выделенные». Её прошивка показывает, только пока в таблице
+  // что-то выделено (рядом всегда стоит «Удалить по интерфейсу»), — наша появляется и исчезает вместе с ней.
+  function injectMoveButton() {
+    const box = /\/staticRoutes\/ipv4\/?$/.test(location.pathname) && document.querySelector('.user-routes-table__buttons');
+    const native = box ? box.querySelectorAll(':scope > ndw-button:not([data-hostsgen-move])') : [];
+    const deleteSelected = native.length > 1 ? native[native.length - 1] : null;
+    const mine = document.querySelector('[data-hostsgen-move]');
+    if (!deleteSelected) {
+      if (mine) mine.remove();
+      return;
+    }
+    if (mine) return;
+    const host = cloneButton(deleteSelected, {
+      marker: 'data-hostsgen-move',
+      label: 'Сменить интерфейс',
+      icon: 'wan-connection',
+      title: 'Перенести выделенные маршруты на другое подключение',
+      onClick: openMoveDialog,
+    });
+    if (host) deleteSelected.after(host);
+  }
+
+  watchPage(() => {
+    injectButton();
+    injectMoveButton();
+  });
 })();

@@ -8,10 +8,13 @@ const hg = require('../web/addon.js');
 const ip = hg.ipToInt;
 const show = (plan) => plan.items.map((i) => `${hg.intToIp(i.net)}/${i.bits}${i.existing ? ' есть' : ''}`);
 
-test('addon.js можно встроить inline в index.html', () => {
-  const src = fs.readFileSync(path.join(__dirname, '../web/addon.js'), 'utf8');
-  assert.ok(!/<\/script/i.test(src), 'закрывающий тег script оборвёт встроенный скрипт');
-  assert.ok(!src.includes('<!--'), 'открытие HTML-комментария внутри script ломает разбор страницы');
+test('web/*.js можно встроить inline в index.html', () => {
+  const dir = path.join(__dirname, '../web');
+  for (const name of fs.readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+    const src = fs.readFileSync(path.join(dir, name), 'utf8');
+    assert.ok(!/<\/script/i.test(src), `${name}: закрывающий тег script оборвёт встроенный скрипт`);
+    assert.ok(!src.includes('<!--'), `${name}: открытие HTML-комментария внутри script ломает разбор страницы`);
+  }
 });
 
 test('maskToBits: только непрерывные маски', () => {
@@ -98,4 +101,39 @@ test('buildPlan: маска, склейка вложенных, существу
 
   // /32: каждый адрес отдельно; 9.9.9.9 уже есть как маршрут до узла
   assert.deepEqual(show(hg.buildPlan({ ips: [{ ip: ip('9.9.9.9'), from: 'e.com' }], nets: [] }, 32, existing)), ['9.9.9.9/32 есть']);
+});
+
+test('смена интерфейса: назначение, сопоставление строк таблицы и команды RCI', () => {
+  const routes = [
+    { network: '216.239.0.0', mask: '255.255.0.0', interface: 'Wireguard0', auto: true, index: 'a1', comment: '' },
+    { host: '107.189.14.230', interface: 'Wireguard0', auto: true, index: 'b2', comment: 'entware' },
+    { network: '10.0.0.0', mask: '255.0.0.0', gateway: '192.168.0.2', interface: 'Bridge0', auto: false, index: 'c3' },
+    { network: '216.239.0.0', mask: '255.255.0.0', interface: 'Wireguard1', auto: true, index: 'd4' },
+  ];
+  assert.equal(hg.routeDestination(routes[0]), '216.239.0.0/16');
+  assert.equal(hg.routeDestination(routes[1]), '107.189.14.230');
+
+  const names = { Wireguard0: 'vpn-nl', Wireguard1: 'test' };
+  const labels = (id) => [names[id], id].filter(Boolean);
+  const { found, missing } = hg.matchRows(
+    [
+      { destination: '216.239.0.0/16', gateway: '', iface: 'test' }, // та же сеть, другой интерфейс — по подписи
+      { destination: '107.189.14.230', gateway: '', iface: 'vpn-nl' },
+      { destination: '10.0.0.0/8', gateway: '192.168.0.2', iface: 'Домашняя сеть' }, // подпись не та, но маршрут один
+      { destination: '1.2.3.0/24', gateway: '', iface: 'vpn-nl' },
+    ],
+    routes,
+    labels,
+  );
+  assert.deepEqual(found.map((r) => r.index), ['d4', 'b2', 'c3']);
+  assert.deepEqual(missing, ['1.2.3.0/24']);
+
+  assert.deepEqual(hg.moveCommands(routes[1], 'Wireguard1', ''), [
+    { ip: { route: { index: 'b2', no: true } } },
+    { ip: { route: { host: '107.189.14.230', interface: 'Wireguard1', auto: true, comment: 'entware' } } },
+  ]);
+  assert.deepEqual(hg.moveCommands(routes[2], 'Wireguard1', 'Policy1'), [
+    { ip: { policy: { name: 'Policy1', route: { index: 'c3', no: true } } } },
+    { ip: { policy: { name: 'Policy1', route: { network: '10.0.0.0', mask: '255.0.0.0', interface: 'Wireguard1', auto: false } } } },
+  ]);
 });
