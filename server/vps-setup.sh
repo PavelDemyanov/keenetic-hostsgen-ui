@@ -53,11 +53,10 @@ check_server() {
 	case "${PROFILE:-}" in 1 | 3) ;; *) fail "неизвестная версия AmneziaWG: ${PROFILE:-}" ;; esac
 	case "${SUBNET:-}" in "" | *[!0-9.]*) fail "неверная сеть VPN: ${SUBNET:-}" ;; esac
 	case "${ENDPOINT:-}" in "" | *[!A-Za-z0-9.-]*) fail "неверный адрес сервера: ${ENDPOINT:-}" ;; esac
-	os=$(. /etc/os-release 2>/dev/null && echo "$ID $ID_LIKE")
-	case " $os " in
-		*" debian "* | *" ubuntu "*) ;;
-		*) fail "поддерживаются только Ubuntu и Debian, а здесь $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")" ;;
-	esac
+	# Только Ubuntu: на Debian и других системах VPN, по опыту, не настраивается даже приложением Amnezia
+	os=$(. /etc/os-release 2>/dev/null && echo "$ID")
+	[ "$os" = ubuntu ] ||
+		fail "нужна Ubuntu, а на сервере $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-другая система}") — переустановите его на Ubuntu 22.04 в панели хостинга"
 	case "$(uname -m)" in
 		x86_64 | aarch64) ;;
 		*) fail "процессор сервера $(uname -m) не поддерживается" ;;

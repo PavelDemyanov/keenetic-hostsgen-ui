@@ -41,7 +41,8 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
     `PROFILE/SUBNET/ENDPOINT` и `server/vps-setup.sh` для `sh -s`, вывод — в `/tmp/hostsgen-ui/vps/log`.
     `vps-status N` отдаёт состояние и журнал с N-й строки, `vps-cancel` прерывает, `vps-clear` удаляет
     журнал (в нём ключ подключения) — веб-модуль зовёт его сразу после импорта.
-- `server/vps-setup.sh` — выполняется на VPS (Ubuntu/Debian, root): ждёт apt свежего сервера, ставит
+- `server/vps-setup.sh` — выполняется на VPS (только Ubuntu — так решил владелец: на Debian, по его опыту,
+  VPN не настраивается даже приложением Amnezia; root): ждёт apt свежего сервера, ставит
   `docker.io`, запускает контейнер `keenetic-awg` на `amneziavpn/amneziawg-go` (конфигурация и `start.sh`
   в `/opt/keenetic-vpn`, NAT внутри контейнера), печатает строки `@@step/@@error/@@done` и настройки
   клиента в base64 между `@@conf-begin` и `@@conf-end`. Повторный запуск добавляет пира, а не переустанавливает.

@@ -181,7 +181,7 @@
   </div>
   <div class="hg-body">
     <div data-role="form">
-      <p class="hg-hint">Роутер сам зайдёт на сервер по SSH, установит Docker и AmneziaWG и создаст здесь подключение. Подойдёт VPS на Ubuntu или Debian с доступом root по паролю. Займёт 3–5 минут.</p>
+      <p class="hg-hint">Роутер сам зайдёт на сервер по SSH, установит Docker и AmneziaWG и создаст здесь подключение. Нужен VPS на Ubuntu (лучше 22.04) с доступом root по паролю. Займёт 3–5 минут.</p>
       <div class="hg-row">
         <label class="hg-field"><span class="hg-label">IP-адрес или домен сервера</span><input class="hg-input" data-role="host" placeholder="203.0.113.10" autocomplete="off" spellcheck="false"></label>
         <label class="hg-field hg-field--narrow"><span class="hg-label">Порт SSH</span><input class="hg-input" data-role="port" value="22" inputmode="numeric" maxlength="5"></label>
