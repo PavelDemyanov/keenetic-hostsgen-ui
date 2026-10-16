@@ -113,9 +113,153 @@
   /** Адрес сервера из строки Endpoint готовой конфигурации. */
   const endpointHost = (conf) => ((conf || '').match(/^Endpoint\s*=\s*(.+):\d+\s*$/m) || [])[1] || '';
 
+  // ---------- настройки «Для опытных» ----------
+
+  /*
+   * Параметры AmneziaWG, которые можно задать вручную. shared — общие для сервера и всех его роутеров:
+   * действуют, только когда сервер настраивается впервые; v3 — есть только в AmneziaWG 3.1.
+   * Границы — что принимает импорт KeeneticOS 5.2 (проверено на роутере) и что не рвёт связь с сервером:
+   * он отвергает ключи старше 150 с, поэтому RekeyAfterTime — до 140 с, а RejectAfterTime — от 150.
+   */
+  const EXPERT_PARAMS = {
+    ListenPort: { kind: 'number', min: 1, max: 65535, shared: true },
+    Jc: { kind: 'number', min: 0, max: 128 },
+    Jmin: { kind: 'number', min: 0, max: 1280 },
+    Jmax: { kind: 'number', min: 0, max: 1280 },
+    S1: { kind: 'number', min: 0, max: 1132, shared: true },
+    S2: { kind: 'number', min: 0, max: 1132, shared: true },
+    S3: { kind: 'number', min: 12, max: 1216, shared: true, v3: true },
+    S4: { kind: 'number', min: 12, max: 32, shared: true, v3: true },
+    H1: { kind: 'header', shared: true },
+    H2: { kind: 'header', shared: true },
+    H3: { kind: 'header', shared: true },
+    H4: { kind: 'header', shared: true },
+    I1: { kind: 'chain', v3: true },
+    I2: { kind: 'chain', v3: true },
+    I3: { kind: 'chain', v3: true },
+    I4: { kind: 'chain', v3: true },
+    I5: { kind: 'chain', v3: true },
+    ContentPaddingAddition: { kind: 'range', min: 0, max: 1000, v3: true },
+    RekeyAfterTime: { kind: 'range', min: 30, max: 140, v3: true },
+    RekeyTimeout: { kind: 'range', min: 1, max: 20, v3: true },
+    RejectAfterTime: { kind: 'range', min: 150, max: 600, v3: true },
+    KeepaliveTimeout: { kind: 'range', min: 1, max: 60, v3: true },
+    MaxHandshakeAttempts: { kind: 'range', min: 1, max: 60, v3: true },
+    PersistentKeepalive: { kind: 'number', min: 0, max: 300 },
+    MTU: { kind: 'number', min: 1280, max: 1420 },
+  };
+  // Строки чужой конфигурации, которые мастер задаёт сам, — их пропускаем молча
+  const EXPERT_SKIPPED = /^(PrivateKey|PublicKey|PresharedKey|Address|DNS|AllowedIPs|Endpoint|HeaderProtectionKey|RandomTrailers|DisableCookies|Table|SaveConfig|FwMark|PreUp|PostUp|PreDown|PostDown)$/i;
+  const UINT32_MAX = 4294967295;
+  const CHAIN_MAX = 1280; // байт в пакете I1–I5: больше — пакет разобьётся на части, а это заметно
+
+  /** «N» или «N-M» → [N, M]; null, если не так. */
+  function parseRange(value) {
+    const m = String(value).match(/^(\d{1,10})(?:-(\d{1,10}))?$/);
+    if (!m) return null;
+    const lo = Number(m[1]);
+    const hi = m[2] === undefined ? lo : Number(m[2]);
+    return lo <= hi ? [lo, hi] : null;
+  }
+
+  /** Длина пакета I1–I5 в байтах или текст ошибки: теги <b 0x…>, <r N>, <rd N>, <rc N>, <t>. */
+  function chainSize(value) {
+    if (/<c>/.test(value)) return 'тег <c> прошивка Keenetic не принимает';
+    if (!/^(<(b 0x([0-9a-f]{2})+|r \d{1,4}|rd \d{1,4}|rc \d{1,4}|t)>)+$/i.test(value)) {
+      return 'нужна цепочка тегов <b 0x…>, <r N>, <rd N>, <rc N>, <t>';
+    }
+    let size = 0;
+    for (const [, tag, arg] of value.matchAll(/<(\w+) ?([^>]*)>/g)) {
+      if (tag === 'b') size += (arg.length - 2) / 2;
+      else if (tag === 't') size += 4;
+      else if (Number(arg) > 1000) return 'в одном теге — не больше 1000 байт';
+      else size += Number(arg);
+    }
+    return size > CHAIN_MAX ? `пакет больше ${CHAIN_MAX} байт` : size;
+  }
+
+  /**
+   * Настройки «Для опытных» → строки «Параметр = значение» для vps-setup.sh (OPTIONS) и ошибки.
+   * custom — свои параметры AmneziaWG, можно вставить целую конфигурацию: ключи, адреса и прочее,
+   * что мастер создаёт сам, пропускаются. mask — первый пакет перед рукопожатием (dns, noise, off),
+   * port — UDP-порт сервера. profile — версия AmneziaWG, которую понимает прошивка (awgProfile).
+   */
+  function expertOptions({ mask = 'dns', port = '', custom = '' } = {}, profile = 3) {
+    const values = {};
+    const errors = [];
+    for (const raw of String(custom).split(/\r?\n/)) {
+      const line = raw.replace(/#.*/, '').trim();
+      if (!line || /^\[\w+\]$/.test(line)) continue;
+      const m = line.match(/^([A-Za-z0-9]+)\s*=\s*(.*)$/);
+      if (!m) {
+        errors.push(`непонятная строка «${line}»`);
+        continue;
+      }
+      const key = Object.keys(EXPERT_PARAMS).find((k) => k.toLowerCase() === m[1].toLowerCase());
+      if (!key) {
+        if (!EXPERT_SKIPPED.test(m[1])) errors.push(`неизвестный параметр «${m[1]}»`);
+        continue;
+      }
+      values[key] = m[2].trim();
+    }
+    const portText = String(port).trim();
+    if (portText) values.ListenPort = portText;
+
+    for (const [key, value] of Object.entries(values)) {
+      const spec = EXPERT_PARAMS[key];
+      const bad = (why) => errors.push(`«${key} = ${value}»: ${why}`);
+      if (spec.v3 && profile !== 3) {
+        errors.push(`«${key}» есть только в AmneziaWG 3.1, а прошивка роутера понимает 1.0`);
+        continue;
+      }
+      const min = profile === 3 && /^S[1-4]$/.test(key) ? 12 : spec.min; // защита заголовков — S от 12
+      if (spec.kind === 'number') {
+        if (!/^\d{1,10}$/.test(value) || Number(value) < min || Number(value) > spec.max) bad(`нужно число от ${min} до ${spec.max}`);
+      } else if (spec.kind === 'range') {
+        const range = parseRange(value);
+        if (!range || range[0] < min || range[1] > spec.max) bad(`нужно число или диапазон «от-до» в пределах ${min}–${spec.max}`);
+      } else if (spec.kind === 'header') {
+        const range = parseRange(value);
+        if (!range || range[1] > UINT32_MAX) bad(profile === 3 ? 'нужно число или диапазон «от-до» до 4294967295' : 'нужно число до 4294967295');
+        else if (profile !== 3 && range[0] !== range[1]) bad('AmneziaWG 1.0 понимает только одно число, без диапазона');
+      } else {
+        const size = chainSize(value);
+        if (typeof size === 'string') bad(size);
+      }
+    }
+    if (errors.length) return { text: '', errors };
+
+    // Заголовки разных типов не должны пересекаться; у 3.1 незаданные — 1, 2, 3, 4
+    const headers = [1, 2, 3, 4]
+      .map((n) => ({ key: `H${n}`, range: parseRange(values[`H${n}`] || (profile === 3 ? String(n) : '')) }))
+      .filter((h) => h.range);
+    headers.forEach((a, i) =>
+      headers.slice(i + 1).forEach((b) => {
+        if (a.range[0] <= b.range[1] && b.range[0] <= a.range[1]) errors.push(`${a.key} и ${b.key} пересекаются`);
+      }),
+    );
+    // Длины пакетов разных типов — 148+S1, 92+S2, 64+S3, 32+S4 — не должны совпадать
+    const sizes = [148, 92, 64, 32]
+      .map((base, i) => ({ key: `S${i + 1}`, size: values[`S${i + 1}`] === undefined ? null : base + Number(values[`S${i + 1}`]) }))
+      .filter((s) => s.size !== null);
+    sizes.forEach((a, i) =>
+      sizes.slice(i + 1).forEach((b) => {
+        if (a.size === b.size) errors.push(`с такими ${a.key} и ${b.key} пакеты разных типов одной длины`);
+      }),
+    );
+    if (values.Jmin !== undefined && values.Jmax !== undefined && Number(values.Jmin) > Number(values.Jmax)) {
+      errors.push('Jmin больше Jmax');
+    }
+    if (errors.length) return { text: '', errors };
+
+    const lines = Object.entries(values).map(([key, value]) => `${key} = ${value}`);
+    if (profile === 3 && ['noise', 'off'].includes(mask)) lines.push(`Mask = ${mask}`); // dns — и так по умолчанию
+    return { text: lines.length ? `${lines.join('\n')}\n` : '', errors };
+  }
+
   if (typeof window === 'undefined') {
     // node --test: чистые функции без DOM
-    module.exports = { awgProfile, pickSubnet, maskPassword, newJob, readStatus, endpointHost, HOST_RE };
+    module.exports = { awgProfile, pickSubnet, maskPassword, newJob, readStatus, endpointHost, expertOptions, HOST_RE };
     return;
   }
 
@@ -196,8 +340,20 @@
       <ul class="hg-notes">
         <li data-role="profile">Проверяю, какую версию AmneziaWG понимает прошивка…</li>
         <li>Пароль нужен один раз: роутер не сохраняет его и не пишет в журнал.</li>
-        <li>Если сервер уже настраивали этой кнопкой, на нём ничего не переустановится — добавится ещё одно подключение.</li>
+        <li>Если сервер уже настраивали этой кнопкой, на нём ничего не переустановится — добавится ещё одно подключение. Параметры маскировки у каждого роутера свои, поэтому один сервер можно отдать нескольким людям.</li>
       </ul>
+      <details class="hg-expert" data-role="expert">
+        <summary>Для опытных</summary>
+        <p class="hg-hint">Обычно здесь ничего менять не нужно: параметры маскировки AmneziaWG и так выбираются случайно — свои у каждого сервера и у каждого роутера.</p>
+        <div class="hg-row">
+          <label class="hg-field" data-role="mask-field"><span class="hg-label">Пакет перед рукопожатием (I1)</span><select class="hg-select" data-role="mask"><option value="dns">Похож на DNS-запрос</option><option value="noise">Случайные байты</option><option value="off">Не отправлять</option></select></label>
+          <label class="hg-field hg-field--narrow"><span class="hg-label">UDP-порт VPN</span><input class="hg-input" data-role="awg-port" placeholder="любой" inputmode="numeric" maxlength="5"></label>
+        </div>
+        <div class="hg-row">
+          <label class="hg-field"><span class="hg-label">Свои параметры AmneziaWG — строки «Параметр = значение»</span><textarea class="hg-text hg-text--short" data-role="custom" spellcheck="false" placeholder="Jc = 4&#10;Jmin = 40&#10;Jmax = 120&#10;I1 = &lt;r 2&gt;&lt;b 0x…&gt;"></textarea></label>
+        </div>
+        <p class="hg-hint hg-hint--small">Порт, S1–S4 и H1–H4 общие для сервера и всех его роутеров — они действуют, только когда сервер настраивается впервые. Остальное (Jc, Jmin, Jmax, I1–I5, таймеры, MTU) — параметры этого роутера. Ключи и адреса из вставленной конфигурации мастер пропускает: их он создаёт сам.</p>
+      </details>
     </div>
     <div data-role="progress" hidden>
       <ul class="hg-steps" data-role="steps"></ul>
@@ -362,6 +518,11 @@
       if (!/^[a-z_][a-z0-9_.-]{0,31}$/.test(user)) throw new Error('неверный логин');
       if (!password) throw new Error('введите пароль от сервера');
       if (!state.router) state.router = await loadRouter();
+      const options = expertOptions({ mask: $('mask').value, port: $('awg-port').value, custom: $('custom').value }, state.router.profile);
+      if (options.errors.length) {
+        $('expert').open = true;
+        throw new Error(`в разделе «Для опытных»: ${options.errors.join('; ')}`);
+      }
       const subnet = pickSubnet(state.router.interfaces.map((i) => ({ address: i.address, mask: i.mask })));
       if (!subnet) throw new Error('не нашёл свободную сеть для VPN среди 10.64.0.0–10.127.255.0');
       savePrefs({ port, user, name: $('name').value.trim() });
@@ -370,7 +531,9 @@
       if (!pad) throw new Error('модуль на роутере устарел — переустановите его');
       const secret = maskPassword(password, pad);
       $('password').value = '';
-      const out = await execHelper(['vps-start', host, port, user, secret, state.router.profile, subnet]);
+      const args = ['vps-start', host, port, user, secret, state.router.profile, subnet];
+      if (options.text) args.push(btoa(options.text)); // восьмой, последний аргумент exec
+      const out = await execHelper(args);
       if (!out.some((l) => l.trim() === 'started')) {
         throw new Error(out.filter((l) => l.trim() && l !== 'process terminated').join('; ') || 'помощник на роутере не начал настройку');
       }
@@ -410,6 +573,7 @@
         state.router.profile === 3
           ? 'Протокол — AmneziaWG 3.1: самая новая маскировка, ваша прошивка её поддерживает.'
           : `Ваша прошивка (${state.router.title || 'версия неизвестна'}) понимает только AmneziaWG 1.0 — её проще заблокировать. AmneziaWG 3.1 появилась в KeeneticOS 5.2.`;
+      $('mask-field').hidden = state.router.profile !== 3; // в AmneziaWG 1.0 пакета I1 нет
       const job = readStatus(await execHelper(['vps-status', 0]), newJob());
       setStatus('');
       if (job.state === 'running' || (job.state === 'done' && job.next < job.total) || (job.state === 'done' && job.conf)) {

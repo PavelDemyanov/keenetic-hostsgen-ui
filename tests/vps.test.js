@@ -73,6 +73,71 @@ test('HOST_RE: IP и домены без пробелов и подчёркив�
   for (const bad of ['', '-x.com', 'x.com.', 'a b', 'a_b.com', 'x;rm', '[::1]']) assert.ok(!vps.HOST_RE.test(bad), bad);
 });
 
+test('expertOptions: строки для vps-setup.sh, чужая конфигурация без ключей и адресов', () => {
+  assert.deepEqual(vps.expertOptions({}, 3), { text: '', errors: [] });
+  assert.deepEqual(vps.expertOptions({ mask: 'dns', port: ' ', custom: '\n' }, 3), { text: '', errors: [] });
+  assert.equal(vps.expertOptions({ mask: 'noise' }, 3).text, 'Mask = noise\n');
+  assert.equal(vps.expertOptions({ mask: 'off' }, 1).text, ''); // в AmneziaWG 1.0 пакета I1 нет
+
+  const pasted = [
+    '[Interface]',
+    'PrivateKey = aGVsbG8=',
+    'Address = 10.8.1.2/32',
+    'DNS = 1.1.1.1',
+    'MTU = 1280',
+    'jc = 5  # регистр ключей не важен',
+    'Jmin = 40',
+    'Jmax = 120',
+    'S1 = 30',
+    'S3 = 40',
+    'H1 = 100000-150000',
+    'I1 = <r 2><b 0x0100000100000000000002766b03636f6d0000010001>',
+    'I2 = <t><rc 10>',
+    'HeaderProtectionKey = aGVsbG8=',
+    'RekeyAfterTime = 90-110',
+    'ListenPort = 51820',
+    '',
+    '[Peer]',
+    'PublicKey = aGVsbG8=',
+    'Endpoint = 203.0.113.10:51820',
+    'PersistentKeepalive = 21',
+  ].join('\n');
+  const options = vps.expertOptions({ mask: 'noise', port: '443', custom: pasted }, 3);
+  assert.deepEqual(options.errors, []);
+  assert.equal(
+    options.text,
+    [
+      'MTU = 1280', 'Jc = 5', 'Jmin = 40', 'Jmax = 120', 'S1 = 30', 'S3 = 40', 'H1 = 100000-150000',
+      'I1 = <r 2><b 0x0100000100000000000002766b03636f6d0000010001>', 'I2 = <t><rc 10>',
+      'RekeyAfterTime = 90-110', 'ListenPort = 443', 'PersistentKeepalive = 21', 'Mask = noise', '',
+    ].join('\n'),
+  );
+});
+
+test('expertOptions: ошибки — до того, как роутер пойдёт на сервер', () => {
+  const errors = (custom, profile = 3, extra = {}) => vps.expertOptions({ custom, ...extra }, profile).errors;
+  assert.match(errors('Foo = 1')[0], /неизвестный параметр «Foo»/);
+  assert.match(errors('просто текст')[0], /непонятная строка/);
+  assert.match(errors('Jc = 200')[0], /от 0 до 128/);
+  assert.match(errors('S1 = 5')[0], /от 12 до 1132/); // защита заголовков 3.1 — S от 12
+  assert.deepEqual(errors('S1 = 5', 1), []);
+  assert.match(errors('S4 = 40')[0], /от 12 до 32/);
+  assert.match(errors('S3 = 10', 1)[0], /только в AmneziaWG 3\.1/);
+  assert.match(errors('I4 = <c><b 0xdeadbeef>')[0], /<c> прошивка Keenetic не принимает/);
+  assert.match(errors('I1 = <r 2><x 5>')[0], /нужна цепочка тегов/);
+  assert.match(errors('I1 = <r 1001>')[0], /не больше 1000/);
+  assert.match(errors('I1 = <r 1000><r 300>')[0], /больше 1280 байт/);
+  assert.match(errors('H1 = 5-10', 1)[0], /только одно число/);
+  assert.match(errors('H1 = 10-5')[0], /диапазон/);
+  assert.match(errors('H1 = 2')[0], /H1 и H2 пересекаются/); // H2 у 3.1 по умолчанию — 2
+  assert.match(errors('H3 = 100-200\nH4 = 150')[0], /H3 и H4 пересекаются/);
+  assert.match(errors('S1 = 12\nS2 = 68')[0], /S1 и S2/); // 148+12 = 92+68
+  assert.match(errors('Jmin = 300\nJmax = 100')[0], /Jmin больше Jmax/);
+  assert.match(errors('RekeyAfterTime = 100-200')[0], /30–140/);
+  assert.match(errors('RejectAfterTime = 120')[0], /150–600/);
+  assert.match(errors('', 3, { port: '70000' })[0], /ListenPort = 70000/);
+});
+
 test('common: plural и errorsOf', () => {
   assert.equal(common.plural(1, 'маршрут', 'маршрута', 'маршрутов'), 'маршрут');
   assert.equal(common.plural(3, 'маршрут', 'маршрута', 'маршрутов'), 'маршрута');

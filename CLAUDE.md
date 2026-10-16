@@ -38,7 +38,8 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
   - `vps-*` — настройка VPS. Пароль идёт не открытым текстом: `vps-pad` выдаёт одноразовую маску, браузер
     шлёт пароль XOR маска, `vps-start` сразу удаляет маску и отвязывается от `exec` (двойной fork + setsid),
     а в фоне запускает `bin/dbclient.<arch>` (dropbear) с паролем в `DROPBEAR_PASSWORD`; stdin — переменные
-    `PROFILE/SUBNET/ENDPOINT` и `server/vps-setup.sh` для `sh -s`, вывод — в `/tmp/hostsgen-ui/vps/log`.
+    `PROFILE/SUBNET/ENDPOINT` (и `OPTIONS`, если в окне что-то задано «Для опытных») и `server/vps-setup.sh`
+    для `sh -s`, вывод — в `/tmp/hostsgen-ui/vps/log`.
     `vps-status N` отдаёт состояние и журнал с N-й строки, `vps-cancel` прерывает, `vps-clear` удаляет
     журнал (в нём ключ подключения) — веб-модуль зовёт его сразу после импорта.
 - `server/vps-setup.sh` — выполняется на VPS (только Ubuntu — так решил владелец: на Debian, по его опыту,
@@ -46,8 +47,22 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
   `docker.io`, запускает контейнер `keenetic-awg` на `amneziavpn/amneziawg-go` (конфигурация и `start.sh`
   в `/opt/keenetic-vpn`, NAT внутри контейнера), печатает строки `@@step/@@error/@@done` и настройки
   клиента в base64 между `@@conf-begin` и `@@conf-end`. Повторный запуск добавляет пира, а не переустанавливает.
-  Параметры AmneziaWG 3.1 — как `AwgInstaller::generateAwgParameters` у Amnezia (Jc 4–6, Jmin 10, Jmax 50,
-  S1–S4 12, H1–H4 1–4, HeaderProtectionKey, диапазоны таймеров, I1 — DNS-ответ про icloud.com).
+  Параметры AmneziaWG делятся так, как их разбирает amneziawg-go (`device/receive.go`, `send.go`):
+  - общие — по ним приёмник опознаёт пакет: S1–S4, H1–H4, HeaderProtectionKey, RandomTrailers. Случайные при
+    первой настройке сервера (`pick_shared`: 3.1 — S1/S2 12–96, S3 12–64, S4 12–20, H 1–4 под защитой заголовков;
+    1.0 — S1/S2 15–150, H случайные), длины 148+S1, 92+S2, 64+S3, 32+S4 различны (`sizes_differ`). `add_peer`
+    копирует роутеру с сервера только их — так работают и серверы версий 1.1.x (S 12, как у Amnezia);
+  - свои у роутера — `client_params`, новые на каждого: Jc 4–7, Jmin 12–48, Jmax на 64–200 больше, I1 —
+    DNS-запрос (`mask_packet`: `<r 2>` ID, A/AAAA/HTTPS о домене из `DNS_NAMES`, иногда EDNS и cookie),
+    таймеры около значений Amnezia (RekeyAfterTime до 120 с: сервер отвергает ключи через 150–180),
+    PersistentKeepalive 20–30. ContentPaddingAddition и I2–I5 — только из «Для опытных».
+  Тесты (`tests/vps-setup.test.js`) подключают сценарий с `VPS_SETUP_TEST=1` (тогда `main` не запускается)
+  и зовут функции в dash с заглушкой `awg`.
+- «Для опытных» в окне: `expertOptions` в `vps.js` проверяет параметры (границы — что принимает импорт
+  KeeneticOS, см. грабли) и собирает строки «Параметр = значение» (плюс `Mask = noise|off`), браузер шлёт
+  их base64 последним аргументом `vps-start`, помощник проверяет только алфавит base64 и длину
+  (`OPTIONS_MAX`), `read_options` в сценарии ещё раз сверяет ключи с белым списком и формат значений, `opt КЛЮЧ`
+  отдаёт значение. Порт, S и H применяются только к новому серверу.
 - Подключение создаёт `vps.js` тем же вызовом, что кнопка «Загрузить из файла»:
   `{"interface":{"wireguard":{"import":{"import": base64(.conf), "name": "", "filename": "…"}}}}`, в ответе
   `created` и `intersects`; затем `{"interface":{"name": …, "description": …}}`, `{…, "up": true}` и сохранение.
@@ -85,7 +100,9 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
   `HOSTS_PER_EXEC` (30) должна укладываться в `MAX_HOSTS` помощника (64).
 - Строки `@@…` — договор между `vps-setup.sh`, помощником (`vps_failure`, ищет `@@step check`, `@@done`,
   `@@error`) и `readStatus` в `vps.js`; заголовок `vps-status` — «@@state СОСТОЯНИЕ СЛЕДУЮЩАЯ ВСЕГО».
-  Аргументов у `exec` не больше восьми: `vps-start` занимает семь.
+  Аргументов у `exec` не больше восьми: `vps-start` с настройками «Для опытных» занимает все восемь.
+- Список параметров «Для опытных» — `EXPERT_PARAMS` в `vps.js` и `case` в `read_options` (`vps-setup.sh`):
+  новый параметр добавлять в оба места (и решить, общий он или свой у роутера).
 - `S99hostsgen-ui` запускает сборку из `bin/`, а не постоянную копию: `start` обновляет копию, только
   когда запущен не из неё.
 - Модуль опирается на внутренности прошивки: веб-корень `/usr/share/htdocs_`, `</body>` в `index.html`,
@@ -101,7 +118,7 @@ hostsgen-ui — пакет кнопок для веб-интерфейса Keene
 
 ```bash
 ./build.sh                                              # тесты + помощник и dbclient под три процессора + dist/install/hostsgen-ui-<процессор>.tar.gz
-node --test tests/*.test.js                             # только тесты веб-модулей и синтаксиса vps-setup.sh
+node --test tests/*.test.js                             # только тесты: веб-модули, функции vps-setup.sh в dash
 node --test --test-name-pattern='parseHar' tests/addon.test.js   # один тест
 node --check web/vps.js                                 # синтаксис модуля
 ./deploy.sh                                             # выложить архив ARCH (mipsel по умолчанию) на роутер с Entware (SSH)
@@ -161,8 +178,17 @@ dbclient собирается из dropbear (версия и SHA-256 — в `bui
   Аргументы `exec` ndm в журнал не пишет; процесс, отвязанный двойным fork и setsid, переживает конец `exec`.
 - В прошивке нет SSH-клиента: `/usr/sbin/dropbear` — мультибинарник только из сервера и `dropbearkey`.
 - AmneziaWG 3.1 прошивка понимает с 5.2 Alpha 11 (параметры — в `/lib/libndmWireguard.so`); в конфигурации
-  роутера это одна строка `wireguard asc` со всеми параметрами, диапазоны — парами чисел. На старых прошивках `vps.js` выбирает AmneziaWG 1.0,
-  а уже настроенный на 3.1 сервер `vps-setup.sh` для такого роутера не трогает (ошибка с советом обновиться).
+  роутера это одна строка `wireguard asc` со всеми параметрами, диапазоны — парами чисел: Jc Jmin Jmax S1 S2
+  H1–H4 S3 S4 "I1"…"I5" ключ, затем пары ContentPaddingAddition, RekeyAfterTime, RekeyTimeout, RejectAfterTime,
+  KeepaliveTimeout, MaxHandshakeAttempts и флаги RandomTrailers, DisableCookies. На старых прошивках `vps.js`
+  выбирает AmneziaWG 1.0, а уже настроенный на 3.1 сервер `vps-setup.sh` для такого роутера не трогает
+  (ошибка с советом обновиться).
+- Импорт KeeneticOS 5.2 (проверено на Beta 0) принимает в I1–I5 теги `<b 0x…>`, `<r N>`, `<rd N>`, `<rc N>`,
+  `<t>`, а на `<c>` отвечает «invalid I4 value»; принимает диапазоны H1–H4, S1/S2 до 1132, S3 до 1216, S4 до 32,
+  Jc 128, Jmax 1280 и конфигурацию в стиле 1.0 (без S3/S4 и ключа). Импорт сам сохраняет конфигурацию
+  роутера, а удаление интерфейса (`{"interface":{"name": …, "no": true}}`) — нет: после проверочного импорта
+  удалить интерфейс и сохранить, иначе он вернётся после перезагрузки. Сохранённая конфигурация интерфейса —
+  `{"show":{"sc":{"interface":{"name": …}}}}`; для проверок — Endpoint из TEST-NET (192.0.2.1).
 - Пароль VPS и пароль роутера Claude не вводит: финальную проверку окна делает пользователь, а для отладки
   `vps-setup.sh` без роутера нужен вход на тестовый VPS по ключу.
 - Прошивка (ndm) запускает `initrc` и хуки `/opt/etc/ndm/*.d` только как `/opt/bin/sh …`, а `/bin/sh` прошивки —
@@ -175,5 +201,6 @@ dbclient собирается из dropbear (версия и SHA-256 — в `bui
 - Название модели процессор не определяет: Giga KN-1011 — mipsel, Giga KN-1012 — aarch64. Выбор — по коду KN-…
   (в журнале загрузки: «Machine model: Keenetic KN-1012»).
 - Проверено на KeeneticOS 5.2: Giga KN-1011 (mipsel, с Entware) и Giga KN-1012 (aarch64, без Entware —
-  установка архивом целиком). Сборка mips на железе не запускалась. VPS проверен один: Ubuntu 22.04 x86_64 (KVM);
-  второй роутер на тот же сервер получил своё подключение без переустановки, первый связь не потерял.
+  установка архивом целиком). Сборка mips на железе не запускалась. VPS: Ubuntu 22.04 x86_64 (KVM) —
+  второй роутер на тот же сервер получил своё подключение без переустановки, первый связь не потерял;
+  версия 1.2 настроила с KN-1011 новый сервер на другом VPS (случайные S1–S4 и свои параметры роутера) — связь есть.

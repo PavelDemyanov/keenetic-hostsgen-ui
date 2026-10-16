@@ -116,6 +116,12 @@
 .hg-steps li.hg-done::before{content:"✓";color:var(--success,#3bb273)}
 .hg-steps li.hg-fail::before{content:"✕";color:var(--error,#de3d3d)}
 .hg-steps li.hg-now::before{content:"…";color:var(--primary-color,#0097dc)}
+.hg-overlay [hidden]{display:none!important}
+.hg-text--short{min-height:84px}
+.hg-expert{margin-top:14px}
+.hg-expert>summary{width:max-content;cursor:pointer;color:var(--text-gray,#949b9f);font-size:12px;line-height:18px;opacity:.7}
+.hg-expert[open]>summary{opacity:1;margin-bottom:8px}
+.hg-hint--small{font-size:12px;line-height:18px;margin-top:8px}
 .hg-log{margin-top:10px}
 .hg-log summary{cursor:pointer;color:var(--text-gray,#949b9f)}
 .hg-log pre{max-height:220px;overflow:auto;margin:6px 0 0;padding:8px 10px;border:1px solid var(--table-border,#4d545f);border-radius:4px;font:12px/18px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}

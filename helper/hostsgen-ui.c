@@ -10,7 +10,7 @@
  *   hostsgen-ui resolve HOSTS…   IPv4-адреса доменов через DNS роутера, по строке на домен:
  *                                «домен ip1 ip2 …» или «домен -»; домены — через запятую или пробел
  *   hostsgen-ui vps-pad          одноразовая маска для пароля сервера (hex)
- *   hostsgen-ui vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ_XOR_МАСКА ВЕРСИЯ_AWG СЕТЬ
+ *   hostsgen-ui vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ_XOR_МАСКА ВЕРСИЯ_AWG СЕТЬ [НАСТРОЙКИ_BASE64]
  *                                в фоне зайти на сервер по SSH и выполнить на нём vps-setup.sh
  *   hostsgen-ui vps-status [N]   состояние и журнал настройки начиная со строки N
  *   hostsgen-ui vps-cancel       прервать настройку
@@ -41,7 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.1.2"
+#define VERSION "1.2.0"
 #define HOME "/opt/share/hostsgen-ui"
 #define ADDON HOME "/addon.js"
 #define SELF HOME "/hostsgen-ui"
@@ -72,6 +72,7 @@
 #define VPS_TIMEOUT 1800     // сек: дольше установка не идёт даже на медленном сервере
 #define STATUS_LINES 200     // строк журнала за один vps-status
 #define STATUS_LINE_MAX 400  // байт в строке журнала для веб-модуля
+#define OPTIONS_MAX 8192     // настройки «Для опытных» в base64; ndm передаёт аргументы exec и длиннее
 
 static const char *const PAGES[] = {"index.html", "index-cloud.html"};
 
@@ -553,15 +554,21 @@ static void vps_job(const char *host, const char *port, const char *user, char *
 	_exit(0);
 }
 
+/* Настройки «Для опытных»: base64 строк «Параметр = значение», их разбирает и проверяет vps-setup.sh */
+static int valid_options(const char *s) {
+	size_t n = strlen(s);
+	return n <= OPTIONS_MAX && strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") == n;
+}
+
 static int cmd_vps_start(int argc, char **argv) {
-	if (argc != 6) {
-		fprintf(stderr, "vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ ВЕРСИЯ СЕТЬ\n");
+	if (argc != 6 && argc != 7) {
+		fprintf(stderr, "vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ ВЕРСИЯ СЕТЬ [НАСТРОЙКИ]\n");
 		return 2;
 	}
 	const char *host = argv[0], *port = argv[1], *user = argv[2], *secret = argv[3], *profile = argv[4],
-	           *subnet = argv[5];
+	           *subnet = argv[5], *options = argc > 6 ? argv[6] : "";
 	if (!valid_host(host) || !valid_number(port, 1, 65535) || !valid_user(user) || !valid_subnet(subnet) ||
-	    (strcmp(profile, "1") != 0 && strcmp(profile, "3") != 0)) {
+	    !valid_options(options) || (strcmp(profile, "1") != 0 && strcmp(profile, "3") != 0)) {
 		say(LOG_ERR, "vps: неверные параметры");
 		return 2;
 	}
@@ -597,7 +604,7 @@ static int cmd_vps_start(int argc, char **argv) {
 	char *script = read_file(VPS_SCRIPT, &script_len);
 	FILE *in = script ? fopen(VPS "/stdin", "wb") : NULL;
 	ok = in && fprintf(in, "PROFILE=%s\nSUBNET=%s\nENDPOINT=%s\n", profile, subnet, host) > 0 &&
-	     fwrite(script, 1, script_len, in) == script_len;
+	     (!*options || fprintf(in, "OPTIONS=%s\n", options) > 0) && fwrite(script, 1, script_len, in) == script_len;
 	if (in && fclose(in) != 0) ok = 0;
 	free(script);
 	ok = ok && write_text(VPS "/log", "") == 0 && write_text(VPS "/state", "running\n") == 0 &&
