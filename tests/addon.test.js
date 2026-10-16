@@ -1,21 +1,10 @@
 // Чистые функции web/addon.js: node --test tests/*.test.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const hg = require('../web/addon.js');
 
 const ip = hg.ipToInt;
 const show = (plan) => plan.items.map((i) => `${hg.intToIp(i.net)}/${i.bits}${i.existing ? ' есть' : ''}`);
-
-test('web/*.js можно встроить inline в index.html', () => {
-  const dir = path.join(__dirname, '../web');
-  for (const name of fs.readdirSync(dir).filter((f) => f.endsWith('.js'))) {
-    const src = fs.readFileSync(path.join(dir, name), 'utf8');
-    assert.ok(!/<\/script/i.test(src), `${name}: закрывающий тег script оборвёт встроенный скрипт`);
-    assert.ok(!src.includes('<!--'), `${name}: открытие HTML-комментария внутри script ломает разбор страницы`);
-  }
-});
 
 test('maskToBits: только непрерывные маски', () => {
   assert.equal(hg.maskToBits('255.255.0.0'), 16);

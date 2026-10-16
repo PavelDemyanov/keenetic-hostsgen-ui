@@ -4,7 +4,8 @@
  * Статическая программа без зависимостей: работает и в голой прошивке (там нет даже mount и awk),
  * и рядом с Entware.
  *
- *   hostsgen-ui start            встроить addon.js в веб-интерфейс: копия index.html + mount --bind
+ *   hostsgen-ui start            встроить addon.js в веб-интерфейс: файл модуля в копии папки ASSETS
+ *                                и ссылка на него в копиях index.html, index-cloud.html (mount --bind)
  *   hostsgen-ui stop             вернуть родные файлы интерфейса
  *   hostsgen-ui status           встроен ли модуль
  *   hostsgen-ui resolve HOSTS…   IPv4-адреса доменов через DNS роутера, по строке на домен:
@@ -22,6 +23,7 @@
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -41,7 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.2.0"
+#define VERSION "1.2.1"
 #define HOME "/opt/share/hostsgen-ui"
 #define ADDON HOME "/addon.js"
 #define SELF HOME "/hostsgen-ui"
@@ -75,6 +77,15 @@
 #define OPTIONS_MAX 8192     // настройки «Для опытных» в base64; ndm передаёт аргументы exec и длиннее
 
 static const char *const PAGES[] = {"index.html", "index-cloud.html"};
+
+/* Модуль — отдельный файл в папке интерфейса, которую подменяем её копией с этим файлом, а в страницы
+ * вставляем только ссылку на него. Встраивать весь addon.js в index.html нельзя: страницы отдаёт не
+ * nginx, а ndm (try_files $uri @ndm), и в KeeneticOS 5.1 он собирает ответ в Io::StringStream
+ * не больше 64 КБ — страница с модулем приходит пустой. Статику nginx отдаёт сам. */
+#define ASSETS "/assets/images/favicon" // в 5.1 и 5.2 только файлы значков; на неё ссылается index.html
+#define ASSETS_COPY RUN "/assets"
+#define SCRIPT "hostsgen-ui.js"
+#define LOADER "<script src=\"" ASSETS "/" SCRIPT "\" defer></script>"
 
 /* Запись в журнал роутера. syslog() из musl ставит время в UTC, а журнал KeeneticOS показывает его
  * как есть, поэтому строку с местным временем отправляем в /dev/log сами. */
@@ -180,13 +191,19 @@ static void install_self(void) {
 	free(bin);
 }
 
-/* Копия страницы с addon.js перед </body>, смонтированная поверх оригинала. */
-static int patch_page(const char *page, const char *addon, size_t addon_len) {
+static int write_file(const char *path, const char *data, size_t len) {
+	FILE *f = fopen(path, "wb");
+	int ok = f && fwrite(data, 1, len, f) == len;
+	if (f && fclose(f) != 0) ok = 0;
+	return ok ? 0 : -1;
+}
+
+/* Копия страницы со ссылкой на файл модуля перед </body>, смонтированная поверх оригинала. */
+static int patch_page(const char *page) {
 	char target[256], copy[256];
 	snprintf(target, sizeof target, "%s/%s", WWW, page);
 	snprintf(copy, sizeof copy, "%s/%s", RUN, page);
 	if (access(target, F_OK) != 0) return 0; // такой страницы в этой прошивке нет
-	if (unmount_all(target) != 0) return -1;
 
 	size_t len;
 	char *html = read_file(target, &len);
@@ -203,9 +220,8 @@ static int patch_page(const char *page, const char *addon, size_t addon_len) {
 	FILE *f = fopen(copy, "wb");
 	int ok = f != NULL;
 	if (ok) {
-		ok = fwrite(html, 1, (size_t)(body - html), f) == (size_t)(body - html) &&
-		     fputs("<script data-hostsgen-ui>\n", f) >= 0 && fwrite(addon, 1, addon_len, f) == addon_len &&
-		     fputs("</script>", f) >= 0 && fputs(body, f) >= 0;
+		ok = fwrite(html, 1, (size_t)(body - html), f) == (size_t)(body - html) && fputs(LOADER, f) >= 0 &&
+		     fputs(body, f) >= 0;
 		if (fclose(f) != 0) ok = 0;
 	}
 	free(html);
@@ -219,6 +235,76 @@ static int patch_page(const char *page, const char *addon, size_t addon_len) {
 	}
 	say(LOG_INFO, "%s: модуль встроен", page);
 	return 0;
+}
+
+/* Удалить копию папки ASSETS (после прошлого запуска). */
+static void remove_assets_copy(void) {
+	DIR *dir = opendir(ASSETS_COPY);
+	if (dir) {
+		char path[512];
+		for (struct dirent *e; (e = readdir(dir));) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+			snprintf(path, sizeof path, "%s/%s", ASSETS_COPY, e->d_name);
+			unlink(path);
+		}
+		closedir(dir);
+	}
+	rmdir(ASSETS_COPY);
+}
+
+/* Скопировать элемент папки ASSETS: файл — содержимым, ссылку — ссылкой. Подпапок там не бывает;
+ * если прошивка положит туда что-то другое, не рискуем: модуль не встраиваем. */
+static int copy_asset(const char *name) {
+	char from[512], to[512], link[512];
+	snprintf(from, sizeof from, "%s%s/%s", WWW, ASSETS, name);
+	snprintf(to, sizeof to, "%s/%s", ASSETS_COPY, name);
+	struct stat st;
+	if (lstat(from, &st) != 0) {
+		say(LOG_ERR, "не удалось прочитать %s: %s", from, strerror(errno));
+		return -1;
+	}
+	if (S_ISLNK(st.st_mode)) {
+		ssize_t n = readlink(from, link, sizeof link - 1);
+		if (n > 0) link[n] = 0;
+		if (n > 0 && symlink(link, to) == 0) return 0;
+	} else if (S_ISREG(st.st_mode)) {
+		size_t len;
+		char *data = read_file(from, &len);
+		int ok = data && write_file(to, data, len) == 0;
+		free(data);
+		if (ok) return 0;
+	} else {
+		say(LOG_ERR, "в %s%s не только файлы (%s) — модуль не встраиваю", WWW, ASSETS, name);
+		return -1;
+	}
+	say(LOG_ERR, "не удалось скопировать %s: %s", from, strerror(errno));
+	return -1;
+}
+
+/* Копия папки ASSETS с файлом модуля, смонтированная поверх оригинала. */
+static int mount_assets(const char *addon, size_t addon_len) {
+	if (unmount_all(WWW ASSETS) != 0) return -1;
+	remove_assets_copy();
+	DIR *dir = opendir(WWW ASSETS);
+	if (!dir) {
+		say(LOG_ERR, "нет папки %s%s: %s", WWW, ASSETS, strerror(errno));
+		return -1;
+	}
+	int ok = mkdir(ASSETS_COPY, 0755) == 0;
+	if (!ok) say(LOG_ERR, "не удалось создать %s: %s", ASSETS_COPY, strerror(errno));
+	for (struct dirent *e; ok && (e = readdir(dir));)
+		if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) ok = copy_asset(e->d_name) == 0;
+	closedir(dir);
+	if (ok && write_file(ASSETS_COPY "/" SCRIPT, addon, addon_len) != 0) {
+		say(LOG_ERR, "не удалось записать %s/%s: %s", ASSETS_COPY, SCRIPT, strerror(errno));
+		ok = 0;
+	}
+	if (ok && mount(ASSETS_COPY, WWW ASSETS, NULL, MS_BIND, NULL) != 0) {
+		say(LOG_ERR, "не удалось смонтировать %s%s: %s", WWW, ASSETS, strerror(errno));
+		ok = 0;
+	}
+	if (!ok) remove_assets_copy();
+	return ok ? 0 : -1;
 }
 
 /* Прошивка запускает initrc и любые скрипты из /opt только через /opt/bin/sh, причём только если та
@@ -244,6 +330,7 @@ static void restore_entware_sh(void) {
 }
 
 static int cmd_start(void) {
+	umask(022); // копии читает nginx от имени nobody — что бы ни досталось от того, кто нас запустил
 	restore_entware_sh();
 	install_self();
 	size_t len;
@@ -252,19 +339,23 @@ static int cmd_start(void) {
 		say(LOG_ERR, "нет %s", ADDON);
 		return 1;
 	}
-	if (strcasestr(addon, "</script")) {
-		say(LOG_ERR, "в addon.js есть закрывающий тег script — встраивать нельзя");
-		free(addon);
-		return 1;
-	}
 	if (mkdir(RUN, 0755) != 0 && errno != EEXIST) {
 		say(LOG_ERR, "не удалось создать %s: %s", RUN, strerror(errno));
 		free(addon);
 		return 1;
 	}
+	// Сначала родные страницы (и встроенные целиком прежними версиями), затем файл модуля и ссылка на
+	// него: без файла ссылку не вставляем
 	int failed = 0;
-	for (size_t i = 0; i < sizeof PAGES / sizeof *PAGES; i++) failed |= patch_page(PAGES[i], addon, len) != 0;
+	char path[256];
+	for (size_t i = 0; i < sizeof PAGES / sizeof *PAGES; i++) {
+		snprintf(path, sizeof path, "%s/%s", WWW, PAGES[i]);
+		failed |= unmount_all(path) != 0;
+	}
+	failed = failed || mount_assets(addon, len) != 0;
 	free(addon);
+	if (failed) return 1;
+	for (size_t i = 0; i < sizeof PAGES / sizeof *PAGES; i++) failed |= patch_page(PAGES[i]) != 0;
 	return failed;
 }
 
@@ -280,6 +371,8 @@ static int cmd_stop(void) {
 		snprintf(path, sizeof path, "%s/%s", RUN, PAGES[i]);
 		unlink(path);
 	}
+	if (is_mounted(WWW ASSETS) && unmount_all(WWW ASSETS) != 0) failed = 1;
+	remove_assets_copy();
 	rmdir(RUN);
 	return failed;
 }
@@ -290,6 +383,7 @@ static int cmd_status(void) {
 		snprintf(path, sizeof path, "%s/%s", WWW, PAGES[i]);
 		if (access(path, F_OK) == 0) printf("%s: %s\n", PAGES[i], is_mounted(path) ? "модуль встроен" : "родной");
 	}
+	printf("%s: %s\n", SCRIPT, is_mounted(WWW ASSETS) ? "на месте, " ASSETS "/" SCRIPT : "нет");
 	return 0;
 }
 

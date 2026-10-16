@@ -3,9 +3,8 @@
  * на роутере, окно поверх страницы и его стили. Модули addon.js («Добавить списком») и vps.js
  * («VPN на своём сервере») берут её из window.hostsgenUi.
  *
- * build.sh склеивает common.js, addon.js и vps.js в один файл, а помощник встраивает его inline
- * в index.html, поэтому здесь, как и в модулях, нельзя писать закрывающий тег script и открытие
- * HTML-комментария — tests это проверяют.
+ * build.sh склеивает common.js, addon.js и vps.js в один addon.js, а помощник отдаёт его отдельным
+ * файлом и вставляет в index.html только ссылку на него (helper/hostsgen-ui.c, mount_assets).
  */
 (() => {
   'use strict';
