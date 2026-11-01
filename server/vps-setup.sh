@@ -9,10 +9,16 @@
 #   SUBNET    первые три октета сети VPN для нового сервера, например 10.77.12 (сервер .1, роутеры .2 и дальше)
 #   ENDPOINT  адрес, по которому роутер подключился к серверу (IP или домен), — он же Endpoint в настройках
 #   OPTIONS   необязательно: настройки из раздела «Для опытных» — строки «Параметр = значение» в base64
+#   MODE      пусто — подключить роутер (и настроить сервер, если он новый). Остальное — для уже настроенного
+#             сервера, PROFILE, SUBNET и OPTIONS тогда не нужны: list — показать его подключения, device —
+#             добавить устройство (телефон, компьютер) с именем NAME (base64), remove — удалить подключение
+#             с открытым ключом PEER
 #
 # Строки для роутера начинаются с @@: «@@step КОД ТЕКСТ», «@@warn ТЕКСТ» (предупреждение, настройка идёт
 # дальше), «@@error ТЕКСТ», затем «@@conf-begin», настройки подключения в base64 и «@@conf-end», в конце
-# «@@done». Остальной вывод — подробный журнал.
+# «@@done». list, device и remove перед @@done выдают «@@server ВЕРСИЯ ПОРТ», «@@now ВРЕМЯ» и по строке
+# «@@peer КЛЮЧ АДРЕС РУКОПОЖАТИЕ ПРИНЯТО ОТПРАВЛЕНО ПОДПИСЬ» на подключение (время — секунды Unix, подпись —
+# комментарий из конфигурации в base64 или «-»). Остальной вывод — подробный журнал.
 # Повторный запуск на том же сервере ничего не переустанавливает: добавляет ещё одно подключение.
 #
 # Параметры маскировки AmneziaWG бывают двух видов — так их разбирает amneziawg-go (device/receive.go, send.go):
@@ -30,11 +36,16 @@ IMAGE=amneziavpn/amneziawg-go:latest
 DNS_NAMES='ya.ru yandex.ru vk.com mail.ru ok.ru dzen.ru avito.ru ozon.ru wildberries.ru gosuslugi.ru rutube.ru
 kinopoisk.ru 2gis.ru hh.ru lenta.ru ria.ru rbc.ru habr.com google.com youtube.com apple.com icloud.com
 microsoft.com github.com wikipedia.org cloudflare.com telegram.org whatsapp.com'
+# Устройству, в отличие от роутера, DNS нужен в настройках подключения — как у Amnezia (1.1.1.1 и 1.0.0.1), —
+# и MTU пониже: его приложения на телефонах ставят 1280, в мобильных сетях пакеты крупнее теряются
+DEVICE_DNS='1.1.1.1, 1.0.0.1'
+DEVICE_MTU=1280
 
-step() { echo "@@step $*"; }
-warn() { echo "@@warn $*"; }
+# printf, а не echo: echo в dash разбирает \n и прочее, а в тексте бывает имя устройства
+step() { printf '%s\n' "@@step $*"; }
+warn() { printf '%s\n' "@@warn $*"; }
 fail() {
-	echo "@@error $*"
+	printf '%s\n' "@@error $*"
 	exit 1
 }
 # Строка в подробный журнал — и из функций, вывод которых собирается в переменную
@@ -69,12 +80,16 @@ wait_apt() {
 	done
 }
 
+check_endpoint() {
+	case "${ENDPOINT:-}" in "" | *[!A-Za-z0-9.-]*) fail "неверный адрес сервера: ${ENDPOINT:-}" ;; esac
+}
+
 check_server() {
 	step check "Проверяю сервер"
 	[ "$(id -u)" = 0 ] || fail "нужен вход под root"
 	case "${PROFILE:-}" in 1 | 2 | 3) ;; *) fail "неизвестная версия AmneziaWG: ${PROFILE:-}" ;; esac
 	case "${SUBNET:-}" in "" | *[!0-9.]*) fail "неверная сеть VPN: ${SUBNET:-}" ;; esac
-	case "${ENDPOINT:-}" in "" | *[!A-Za-z0-9.-]*) fail "неверный адрес сервера: ${ENDPOINT:-}" ;; esac
+	check_endpoint
 	# Только Ubuntu: на Debian и других системах VPN, по опыту, не настраивается даже приложением Amnezia
 	os=$(. /etc/os-release 2>/dev/null && echo "$ID")
 	[ "$os" = ubuntu ] ||
@@ -396,7 +411,8 @@ END
 	chmod 755 "$DIR/start.sh"
 }
 
-# Конфигурация сервера: новая (awg0.conf.new) или действующая; в неё дописывается роутер
+# Конфигурация сервера: новая (awg0.conf.new) или действующая; в неё дописывается роутер или, если задан
+# DEVICE (имя), устройство
 add_peer() {
 	src=$CONF.new
 	[ -f "$src" ] || src=$CONF
@@ -418,30 +434,42 @@ add_peer() {
 		cat "$src"
 		echo
 		echo "[Peer]"
-		echo "# роутер Keenetic, $(date '+%Y-%m-%d %H:%M')"
+		if [ -n "${DEVICE:-}" ]; then
+			printf '# устройство: %s, %s\n' "$DEVICE" "$(date '+%Y-%m-%d %H:%M')"
+		else
+			echo "# роутер Keenetic, $(date '+%Y-%m-%d %H:%M')"
+		fi
 		echo "PublicKey = $client_pub"
 		echo "PresharedKey = $psk"
 		echo "AllowedIPs = $SUBNET.$n/32"
 	} >"$CONF.tmp" && mv "$CONF.tmp" "$CONF" && rm -f "$CONF.new" || fail "не удалось записать $CONF"
 	chmod 600 "$CONF"
 
-	# Общие параметры — с сервера, свои — новые для этого роутера
+	# Общие параметры — с сервера, свои — новые для этого роутера или устройства. Устройству — как у Amnezia:
+	# DNS и весь трафик, IPv6 тоже (его сервер не выпускает, зато адрес IPv6 устройства не виден сайтам)
 	shared=$(grep -E '^(S[1-4]|H[1-4]|HeaderProtectionKey|RandomTrailers) *=' "$CONF" | sed 's/ *= */ = /')
 	own=$(client_params)
 	keepalive=$(opt PersistentKeepalive || rnd 20 30)
-	note "Свои параметры роутера: $(echo "$own" | grep -E '^J' | tr '\n' ' ')PersistentKeepalive = $keepalive"
+	who=роутера
+	[ -z "${DEVICE:-}" ] || who=устройства
+	note "Свои параметры $who: $(echo "$own" | grep -E '^J' | tr '\n' ' ')PersistentKeepalive = $keepalive"
 	CLIENT_CONF=$(
 		echo "[Interface]"
 		echo "PrivateKey = $client_key"
 		echo "Address = $SUBNET.$n/32"
-		mtu=$(opt MTU) && echo "MTU = $mtu"
+		if [ -n "${DEVICE:-}" ]; then
+			echo "DNS = $DEVICE_DNS"
+			echo "MTU = $DEVICE_MTU"
+		else
+			mtu=$(opt MTU) && echo "MTU = $mtu"
+		fi
 		echo "$shared"
 		echo "$own"
 		echo
 		echo "[Peer]"
 		echo "PublicKey = $server_pub"
 		echo "PresharedKey = $psk"
-		echo "AllowedIPs = 0.0.0.0/0"
+		if [ -n "${DEVICE:-}" ]; then echo "AllowedIPs = 0.0.0.0/0, ::/0"; else echo "AllowedIPs = 0.0.0.0/0"; fi
 		echo "Endpoint = $ENDPOINT:$port"
 		echo "PersistentKeepalive = $keepalive"
 	)
@@ -449,10 +477,11 @@ add_peer() {
 
 start_container() {
 	# порт — в шаге, а не только в журнале: его открывают в брандмауэре хостинга, если он там есть
-	step start "Запускаю сервер AmneziaWG (UDP-порт $port)"
 	if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+		step start "Перезапускаю сервер AmneziaWG (UDP-порт $port)"
 		docker restart "$CONTAINER" >/dev/null || restore_and_fail "не удалось перезапустить контейнер $CONTAINER"
 	else
+		step start "Запускаю сервер AmneziaWG (UDP-порт $port)"
 		docker run -d --name "$CONTAINER" --restart unless-stopped \
 			--cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 \
 			--log-opt max-size=1m -p "$port:$port/udp" -v "$DIR:/etc/amneziawg" \
@@ -482,7 +511,96 @@ restore_and_fail() {
 	fail "$*"
 }
 
+# Подключения из конфигурации: «КЛЮЧ АДРЕС КОММЕНТАРИЙ» на строку. Адрес — первый из AllowedIPs без маски,
+# комментарий — первая строка «# …» в блоке [Peer]: её пишет add_peer, у добавленных вручную её может не быть.
+peer_lines() {
+	awk '
+		function value(line) { sub(/^[^=]*=[ \t]*/, "", line); sub(/[ \t\r]*$/, "", line); return line }
+		function flush() { if (peer && key != "") print key, (addr == "" ? "-" : addr), comment; peer = 0; key = addr = comment = "" }
+		/^[ \t]*\[/ { flush(); peer = $0 ~ /^[ \t]*\[Peer\]/; next }
+		!peer { next }
+		/^[ \t]*#/ { if (comment == "") { comment = $0; sub(/^[ \t]*#[ \t]*/, "", comment) } next }
+		/^[ \t]*PublicKey[ \t]*=/ { key = value($0) }
+		/^[ \t]*AllowedIPs[ \t]*=/ { addr = value($0); sub(/[\/, ].*/, "", addr) }
+		END { flush() }
+	' "$CONF"
+}
+
+# Убрать подключение с ключом PEER; старая конфигурация остаётся в .bak до перезапуска сервера
+remove_peer() {
+	case ${PEER:-} in "" | *[!A-Za-z0-9+/=]*) fail "неверный ключ подключения" ;; esac
+	[ "${#PEER}" = 44 ] || fail "неверный ключ подключения"
+	peer_lines | grep -q "^$PEER " || fail "этого подключения на сервере уже нет — обновите список"
+	cp "$CONF" "$CONF.bak" || fail "не удалось сохранить копию $CONF"
+	awk -v key="$PEER" '
+		function flush() { if (!drop) printf "%s", block; block = ""; drop = 0 }
+		/^[ \t]*\[/ { flush() }
+		{ block = block $0 "\n" }
+		/^[ \t]*PublicKey[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t\r]*$/, "", v); if (v == key) drop = 1 }
+		END { flush() }
+	' "$CONF.bak" >"$CONF.tmp" && mv "$CONF.tmp" "$CONF" || {
+		mv "$CONF.bak" "$CONF"
+		fail "не удалось записать $CONF"
+	}
+	chmod 600 "$CONF"
+}
+
+# Подключения сервера для окна «Устройства»: версия и порт, время сервера, затем по строке на подключение
+# с последним рукопожатием и трафиком из awg show (у остановленного сервера — нули)
+list_peers() {
+	dump=$(docker exec "$CONTAINER" awg show awg0 dump 2>/dev/null)
+	echo "@@server $PROFILE $port"
+	echo "@@now $(date +%s)"
+	peer_lines | while read -r key addr comment; do
+		# в dump у пира: ключ, PSK, адрес клиента, AllowedIPs, рукопожатие, принято, отправлено, keepalive
+		set -- $(printf '%s\n' "$dump" | awk -v k="$key" '$1 == k { print $5, $6, $7; exit }')
+		label=$(printf '%s' "$comment" | base64 | tr -d '\n')
+		echo "@@peer $key $addr ${1:-0} ${2:-0} ${3:-0} ${label:--}"
+	done
+}
+
+# Подключения уже настроенного сервера (MODE): список, новое устройство, удаление. Сервер здесь не ставится:
+# устройства добавляются к серверу, который настроил роутер, и на его версии AmneziaWG
+manage() {
+	step check "Проверяю сервер"
+	[ "$(id -u)" = 0 ] || fail "нужен вход под root"
+	[ -f "$CONF" ] && command -v docker >/dev/null 2>&1 ||
+		fail "на этом сервере нет VPN, настроенного роутером Keenetic, — сначала создайте подключение кнопкой «Создать на своём сервере»"
+	PROFILE=$(server_profile)
+	port=$(sed -n 's/^ListenPort *= *//p' "$CONF")
+	case $MODE in
+		list) ;;
+		device)
+			check_endpoint
+			# имя — только для подписи в конфигурации: без управляющих символов, не длиннее 120 байт
+			DEVICE=$(printf '%s' "${NAME:-}" | base64 -d 2>/dev/null | tr -d '\000-\037\177')
+			[ -n "$DEVICE" ] && [ "$(printf '%s' "$DEVICE" | wc -c)" -le 120 ] || fail "неверное имя устройства"
+			step config "Добавляю устройство «$DEVICE» ($(awg_name "$PROFILE"))"
+			add_peer
+			start_container
+			;;
+		remove)
+			step config "Удаляю подключение"
+			remove_peer
+			start_container
+			;;
+		*) fail "неизвестное действие: $MODE" ;;
+	esac
+	step done "Подключений на сервере: $(grep -c '^\[Peer\]' "$CONF")"
+	list_peers
+	if [ "$MODE" = device ]; then
+		echo "@@conf-begin"
+		printf '%s\n' "$CLIENT_CONF" | base64
+		echo "@@conf-end"
+	fi
+	echo "@@done"
+}
+
 main() {
+	if [ -n "${MODE:-}" ]; then
+		manage
+		return
+	fi
 	check_server
 	read_options
 	choose_profile

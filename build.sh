@@ -69,7 +69,7 @@ for build in $BUILDS; do
 done
 
 # Веб-модули встраиваются одним скриптом: сначала общая часть, на которую опираются остальные
-cat web/common.js web/addon.js web/vps.js >dist/addon.js
+cat web/common.js web/qr.js web/addon.js web/vps.js >dist/addon.js
 
 # Архив под каждый процессор. Прошивка запускает initrc и вообще скрипты из /opt только через /opt/bin/sh,
 # лежащую в /opt, — обычно её привозит Entware. Без Entware её даёт наш архив: ссылку на помощник своего

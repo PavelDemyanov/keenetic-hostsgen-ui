@@ -1,9 +1,10 @@
 /*
  * hostsgen-ui — общая часть модулей веб-интерфейса KeeneticOS: запросы к RCI, вызов помощника
  * на роутере, окно поверх страницы и его стили. Модули addon.js («Добавить списком») и vps.js
- * («VPN на своём сервере») берут её из window.hostsgenUi.
+ * («VPN на своём сервере», «Добавить устройство») берут её из window.hostsgenUi, qr.js дописывает туда
+ * QR-код.
  *
- * build.sh склеивает common.js, addon.js и vps.js в один addon.js, а помощник отдаёт его отдельным
+ * build.sh склеивает common.js, qr.js, addon.js и vps.js в один addon.js, а помощник отдаёт его отдельным
  * файлом и вставляет в index.html только ссылку на него (helper/hostsgen-ui.c, mount_assets).
  */
 (() => {
@@ -126,8 +127,12 @@
 .hg-log{margin-top:10px}
 .hg-log summary{cursor:pointer;color:var(--text-gray,#949b9f)}
 .hg-log pre{max-height:220px;overflow:auto;margin:6px 0 0;padding:8px 10px;border:1px solid var(--table-border,#4d545f);border-radius:4px;font:12px/18px ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+.hg-btn--small{height:26px;padding:0 10px;font-size:13px}
+.hg-small{font-size:12px;line-height:16px}
+.hg-qr{display:flex;justify-content:center;margin:4px 0 8px}
+.hg-qr svg{display:block;max-width:100%;height:auto;border-radius:4px}
 .hg-foot{display:flex;justify-content:flex-end;gap:12px;padding:12px 24px 20px}
-@media (max-width:600px){.hg-head,.hg-body,.hg-foot{padding-left:16px;padding-right:16px}.hg-title{font-size:18px}}
+@media (max-width:600px){.hg-head,.hg-body,.hg-foot{padding-left:16px;padding-right:16px}.hg-title{font-size:18px}.hg-devices th:nth-child(2),.hg-devices td:nth-child(2){display:none}}
 `;
 
   function injectStyle() {

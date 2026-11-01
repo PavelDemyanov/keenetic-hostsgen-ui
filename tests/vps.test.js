@@ -199,3 +199,83 @@ test('server/vps-setup.sh: синтаксис POSIX sh', () => {
   const r = spawnSync(shell, ['-n', path.join(__dirname, '../server/vps-setup.sh')], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
 });
+
+// ---------- «Добавить устройство» ----------
+
+const b64 = (text) => Buffer.from(text).toString('base64');
+
+test('readStatus: работа окна «Устройства» — чья она, сервер, подключения и настройки устройства', () => {
+  const key1 = `${'A'.repeat(42)}a=`;
+  const key2 = `${'B'.repeat(42)}b=`;
+  const conf = '[Interface]\nPrivateKey = K=\nDNS = 1.1.1.1, 1.0.0.1\n\n[Peer]\nEndpoint = 203.0.113.10:41234\n';
+  const confLines = b64(conf).match(/.{1,40}/g);
+  const job = vps.readStatus(
+    ['@@state running 9 9', '@@job device', '@@step check Проверяю сервер', '@@step config Добавляю устройство «Телефон» (AmneziaWG 3.1)',
+      '@@server 3 41234', '@@now 1792000300',
+      `@@peer ${key1} 10.75.144.2 1792000000 123 456 ${b64('роутер Keenetic, 2026-10-13 21:04')}`,
+      `@@peer ${key2} 10.75.144.3 0 0 0 ${b64('устройство: Телефон, мой, 2026-10-23 20:15')}`,
+      '@@conf-begin', confLines[0], 'process terminated'],
+    vps.newJob(),
+  );
+  // журнал пришёл двумя порциями: ndm дописал «process terminated» посреди настроек
+  vps.readStatus(['@@state done 14 14', ...confLines.slice(1), '@@conf-end', '@@done', ''], job);
+  assert.equal(job.kind, 'device');
+  assert.deepEqual(job.server, { profile: 3, port: '41234' });
+  assert.equal(job.now, 1792000300);
+  assert.deepEqual(job.peers, [
+    { key: key1, address: '10.75.144.2', handshake: 1792000000, rx: 123, tx: 456, kind: 'router', name: '', added: '2026-10-13 21:04' },
+    { key: key2, address: '10.75.144.3', handshake: 0, rx: 0, tx: 0, kind: 'device', name: 'Телефон, мой', added: '2026-10-23 20:15' },
+  ]);
+  assert.equal(job.conf, conf);
+  assert.equal(job.done, true);
+  assert.deepEqual(job.log, []);
+  // журнал «Создать на своём сервере» от помощника 1.4 и старого, без @@job
+  assert.equal(vps.readStatus(['@@job router'], vps.newJob()).kind, 'router');
+  assert.equal(vps.readStatus(['@@step check Проверяю сервер'], vps.newJob()).kind, null);
+});
+
+test('parsePeerLabel и peerTitle: роутеры, устройства, подключения без подписи', () => {
+  assert.deepEqual(vps.parsePeerLabel('роутер Keenetic, 2026-10-13 21:04'), { kind: 'router', name: '', added: '2026-10-13 21:04' });
+  assert.deepEqual(vps.parsePeerLabel('роутер Keenetic'), { kind: 'router', name: '', added: '' });
+  assert.deepEqual(vps.parsePeerLabel('устройство: Ноутбук, 2026-10-23 20:15'), { kind: 'device', name: 'Ноутбук', added: '2026-10-23 20:15' });
+  assert.deepEqual(vps.parsePeerLabel('ноутбук Васи'), { kind: 'other', name: 'ноутбук Васи', added: '' });
+  assert.deepEqual(vps.parsePeerLabel(''), { kind: 'other', name: '', added: '' });
+  assert.equal(vps.peerTitle({ kind: 'router' }, 'VPN Нидерланды'), 'Этот роутер — VPN Нидерланды');
+  assert.equal(vps.peerTitle({ kind: 'router' }), 'Роутер Keenetic');
+  assert.equal(vps.peerTitle({ kind: 'device', name: 'Ноутбук' }), 'Ноутбук');
+  assert.equal(vps.peerTitle({ kind: 'other', name: '' }), 'Без подписи');
+});
+
+test('linkText и formatBytes: связь и трафик по-человечески', () => {
+  const now = 1792000000;
+  assert.equal(vps.linkText({ handshake: 0 }, now), 'ещё не подключалось');
+  assert.equal(vps.linkText({ handshake: now - 100 }, now), 'на связи');
+  assert.equal(vps.linkText({ handshake: now + 30 }, now), 'на связи', 'часы сервера и роутера могут расходиться');
+  assert.equal(vps.linkText({ handshake: now - 300 }, now), 'был на связи 5 минут назад');
+  assert.equal(vps.linkText({ handshake: now - 2 * 3600 }, now), 'был на связи 2 часа назад');
+  assert.equal(vps.linkText({ handshake: now - 21 * 86400 }, now), 'был на связи 21 день назад');
+  assert.equal(vps.formatBytes(512), '512 Б');
+  assert.equal(vps.formatBytes(1536), '1,5 КБ');
+  assert.equal(vps.formatBytes(250 * 1024 * 1024), '250 МБ');
+  assert.equal(vps.formatBytes(3.25 * 1024 ** 3), '3,3 ГБ');
+});
+
+test('deviceNameError, deviceFileName и toBase64: имя устройства', () => {
+  assert.equal(vps.deviceNameError('Телефон Паши'), '');
+  assert.match(vps.deviceNameError(''), /введите имя/);
+  assert.match(vps.deviceNameError('я'.repeat(33)), /не длиннее 32/);
+  assert.equal(vps.deviceNameError('я'.repeat(32)), '');
+  assert.match(vps.deviceNameError('a\nb'), /недопустимые/);
+  assert.equal(vps.deviceFileName('Телефон Паши'), 'Telefon_Pashi.conf');
+  assert.equal(vps.deviceFileName('Ноутбук Юли (рабочий)'), 'Noutbuk_Yuli_ra.conf');
+  assert.equal(vps.deviceFileName('iPhone 15'), 'iPhone_15.conf');
+  assert.equal(vps.deviceFileName('😀'), 'amneziawg.conf');
+  assert.equal(vps.fromBase64(vps.toBase64('Телефон Паши')), 'Телефон Паши');
+  assert.equal(vps.toBase64('Телефон'), b64('Телефон'));
+});
+
+test('deviceAppNote: какие приложения подойдут к серверу', () => {
+  assert.match(vps.deviceAppNote(3), /AmneziaVPN 5 и новее.*на iPhone — только оно.*WireGuard не подойдёт/);
+  assert.match(vps.deviceAppNote(2), /AmneziaWG 2\.0 и новее/);
+  assert.match(vps.deviceAppNote(1), /любое приложение/);
+});

@@ -254,3 +254,132 @@ test('add_peer: сервер на 2.0 — роутеру S1–S4 и H с сер�
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------- устройства: MODE=list|device|remove на уже настроенном сервере ----------
+
+const ROUTER_KEY = `${'R'.repeat(42)}a=`;
+const OTHER_KEY = `${'O'.repeat(42)}b=`;
+// docker: контейнер есть, перезапуск проходит, awg show … dump — из $DUMP; id — будто root
+const MANAGE_STUBS = `id() { echo 0; }
+docker() {
+	case $1 in
+		inspect | restart) return 0 ;;
+		exec) [ "\${6:-}" = dump ] && printf '%s\\n' "$DUMP"; return 0 ;;
+	esac
+}`;
+
+/** Сервер 3.1 с роутером и подключением, добавленным вручную (без комментария); code — что выполнить. */
+function manage(env, check) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vps-manage-'));
+  const conf = path.join(dir, 'awg0.conf');
+  fs.writeFileSync(
+    conf,
+    [
+      '[Interface]', 'PrivateKey = SERVER=', 'Address = 10.75.144.1/24', 'ListenPort = 41234', 'Jc = 5', 'Jmin = 10', 'Jmax = 50',
+      'S1 = 30', 'S2 = 40', 'S3 = 20', 'S4 = 14', 'H1 = 1', 'H2 = 2', 'H3 = 3', 'H4 = 4', 'HeaderProtectionKey = HPK+/x=',
+      'RandomTrailers = on', 'DisableCookies = on', '',
+      '[Peer]', '# роутер Keenetic, 2026-10-13 21:04', `PublicKey = ${ROUTER_KEY}`, 'PresharedKey = PSK1=', 'AllowedIPs = 10.75.144.2/32', '',
+      '[Peer]', `PublicKey = ${OTHER_KEY}`, 'AllowedIPs = 10.75.144.7/32, 192.168.5.0/24', '',
+    ].join('\n'),
+  );
+  const dump = [`SERVER=\tPSERVER=\t41234\toff`, `${ROUTER_KEY}\tPSK1=\t198.51.100.7:4500\t10.75.144.2/32\t1792000000\t123456\t654321\t25`].join('\n');
+  try {
+    const r = run(`CONF=$TEST_CONF; ${MANAGE_STUBS}\nmain`, { TEST_CONF: conf, DUMP: dump, ...env });
+    return check({ ...r, server: fs.readFileSync(conf, 'utf8'), lines: r.out.split('\n') });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const peersOf = (lines) =>
+  lines
+    .filter((l) => l.startsWith('@@peer '))
+    .map((l) => {
+      const [, key, addr, handshake, rx, tx, label] = l.split(' ');
+      return { key, addr, handshake, rx, tx, comment: label === '-' ? '' : Buffer.from(label, 'base64').toString() };
+    });
+
+test('MODE=list: подключения сервера с рукопожатием и трафиком, без перезапуска', () => {
+  manage({ MODE: 'list' }, (r) => {
+    assert.equal(r.status, 0, r.out + r.err);
+    assert.ok(r.lines.includes('@@server 3 41234'));
+    assert.ok(r.lines.some((l) => /^@@now \d+$/.test(l)));
+    assert.deepEqual(peersOf(r.lines), [
+      { key: ROUTER_KEY, addr: '10.75.144.2', handshake: '1792000000', rx: '123456', tx: '654321', comment: 'роутер Keenetic, 2026-10-13 21:04' },
+      { key: OTHER_KEY, addr: '10.75.144.7', handshake: '0', rx: '0', tx: '0', comment: '' },
+    ]);
+    assert.doesNotMatch(r.out, /@@step start|@@conf-begin/);
+    assert.equal(r.lines.filter((l) => l === '@@done').length, 1);
+  });
+});
+
+test('MODE=device: устройству — общие параметры сервера, DNS, MTU 1280 и весь трафик', () => {
+  const name = 'Телефон Паши';
+  manage({ MODE: 'device', NAME: Buffer.from(name).toString('base64'), ENDPOINT: 'vpn.example.com' }, (r) => {
+    assert.equal(r.status, 0, r.out + r.err);
+    assert.ok(r.lines.includes('@@step config Добавляю устройство «Телефон Паши» (AmneziaWG 3.1)'));
+    assert.ok(r.lines.includes('@@step start Перезапускаю сервер AmneziaWG (UDP-порт 41234)'));
+    const b64 = r.out.match(/@@conf-begin\n([\s\S]*?)\n@@conf-end/)[1].replace(/\n/g, '');
+    const [iface, peer] = Buffer.from(b64, 'base64').toString().split('[Peer]');
+    const p = params(iface);
+    for (const [key, value] of Object.entries({ S1: '30', S2: '40', S3: '20', S4: '14', H1: '1', H4: '4', HeaderProtectionKey: 'HPK+/x=', RandomTrailers: 'on' })) {
+      assert.equal(p[key], value, key);
+    }
+    assert.equal(p.Address, '10.75.144.8/32', 'следующий после самого большого адреса');
+    assert.equal(p.DNS, '1.1.1.1, 1.0.0.1');
+    assert.equal(p.MTU, '1280');
+    decodeDnsMask(p.I1);
+    assert.ok(range(p.RekeyAfterTime)[1] <= 120);
+    const pp = params(peer);
+    assert.equal(pp.AllowedIPs, '0.0.0.0/0, ::/0');
+    assert.equal(pp.Endpoint, 'vpn.example.com:41234');
+    assert.match(r.server, /^# устройство: Телефон Паши, \d{4}-\d\d-\d\d \d\d:\d\d$/m);
+    const peers = peersOf(r.lines);
+    assert.equal(peers.length, 3);
+    assert.match(peers[2].comment, /^устройство: Телефон Паши, /);
+    assert.equal(peers[2].addr, '10.75.144.8');
+    // конфигурация — после списка, @@done — последней
+    assert.ok(r.out.indexOf('@@peer ') < r.out.indexOf('@@conf-begin'));
+    assert.equal(r.lines.filter(Boolean).pop(), '@@done');
+  });
+});
+
+test('MODE=device: имя с управляющими символами не подделает строки @@', () => {
+  const name = 'x\n@@done\n@@error ой\\n';
+  manage({ MODE: 'device', NAME: Buffer.from(name).toString('base64'), ENDPOINT: '203.0.113.10' }, (r) => {
+    assert.equal(r.status, 0, r.out + r.err);
+    assert.equal(r.lines.filter((l) => l === '@@done').length, 1);
+    assert.ok(!r.lines.some((l) => l.startsWith('@@error')));
+    assert.match(r.server, /^# устройство: x@@done@@error ой\\n, /m);
+  });
+  manage({ MODE: 'device', NAME: '', ENDPOINT: '203.0.113.10' }, (r) => assert.match(r.out, /@@error неверное имя устройства/));
+  manage({ MODE: 'device', NAME: Buffer.from('я'.repeat(61)).toString('base64'), ENDPOINT: '203.0.113.10' }, (r) =>
+    assert.match(r.out, /@@error неверное имя устройства/),
+  );
+  manage({ MODE: 'device', NAME: 'eA==', ENDPOINT: 'a;b' }, (r) => assert.match(r.out, /@@error неверный адрес сервера/));
+});
+
+test('MODE=remove: удаляется только этот блок [Peer], сервер перезапускается', () => {
+  manage({ MODE: 'remove', PEER: ROUTER_KEY }, (r) => {
+    assert.equal(r.status, 0, r.out + r.err);
+    assert.doesNotMatch(r.server, /роутер Keenetic|PSK1=|10\.75\.144\.2\//);
+    assert.match(r.server, /^\[Interface\]\nPrivateKey = SERVER=\n/);
+    assert.match(r.server, /DisableCookies = on\n\n\[Peer\]\nPublicKey = O+b=\n/);
+    assert.ok(r.lines.includes('@@step done Подключений на сервере: 1'));
+    assert.deepEqual(peersOf(r.lines).map((p) => p.key), [OTHER_KEY]);
+  });
+  manage({ MODE: 'remove', PEER: `${'Z'.repeat(43)}=` }, (r) => {
+    assert.match(r.out, /@@error этого подключения на сервере уже нет/);
+    assert.match(r.server, /роутер Keenetic/);
+  });
+  for (const bad of ['', 'abc', `${'R'.repeat(42)}a=;`, `${'R'.repeat(43)}`]) {
+    manage({ MODE: 'remove', PEER: bad }, (r) => assert.match(r.out, /@@error неверный ключ подключения/, bad));
+  }
+});
+
+test('MODE на сервере без нашего VPN — понятная ошибка', () => {
+  const r = run(`CONF=/nonexistent/awg0.conf; ${MANAGE_STUBS}\nmain`, { MODE: 'list' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /@@error на этом сервере нет VPN, настроенного роутером Keenetic/);
+  assert.match(run(`CONF=$SETUP; ${MANAGE_STUBS}\nmain`, { MODE: 'reboot' }).out, /@@error неизвестное действие/);
+});

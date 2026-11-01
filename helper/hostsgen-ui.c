@@ -13,6 +13,9 @@
  *   hostsgen-ui vps-pad          одноразовая маска для пароля сервера (hex)
  *   hostsgen-ui vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ_XOR_МАСКА ВЕРСИЯ_AWG СЕТЬ [НАСТРОЙКИ_BASE64]
  *                                в фоне зайти на сервер по SSH и выполнить на нём vps-setup.sh
+ *   hostsgen-ui vps-device АДРЕС ПОРТ ЛОГИН ПАРОЛЬ_XOR_МАСКА list|device ИМЯ_BASE64|remove КЛЮЧ
+ *                                то же для уже настроенного сервера: список подключений, новое
+ *                                устройство (телефон, компьютер), удаление подключения
  *   hostsgen-ui vps-status [N]   состояние и журнал настройки начиная со строки N
  *   hostsgen-ui vps-cancel       прервать настройку
  *   hostsgen-ui vps-clear        удалить журнал (в нём ключ подключения)
@@ -43,7 +46,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.3.1"
+#define VERSION "1.4.0"
 #define HOME "/opt/share/hostsgen-ui"
 #define ADDON HOME "/addon.js"
 #define SELF HOME "/hostsgen-ui"
@@ -459,9 +462,11 @@ static int cmd_resolve(int argc, char **argv) {
 // пароль, сложенный с ней по XOR, а vps-start сразу удаляет маску. Дальше пароль живёт только
 // в окружении dbclient (DROPBEAR_PASSWORD).
 //
-// vps-start отвязывается от exec (ndm ждёт закрытия вывода) и в фоне запускает dbclient, у которого
-// stdin — переменные и vps-setup.sh, а stdout и stderr — журнал VPS/log. Веб-модуль читает журнал
-// через vps-status; строки «@@…» в нём — шаги, ошибка и настройки подключения от vps-setup.sh.
+// vps-start и vps-device отвязываются от exec (ndm ждёт закрытия вывода) и в фоне запускают dbclient,
+// у которого stdin — переменные и vps-setup.sh, а stdout и stderr — журнал VPS/log. Веб-модуль читает
+// журнал через vps-status; строки «@@…» в нём — шаги, ошибка и настройки подключения от vps-setup.sh.
+// Первая строка журнала — «@@job router|device»: окна «Создать на своём сервере» и «Устройства» так
+// отличают свою настройку от чужой.
 
 static int write_text(const char *path, const char *text) {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -648,24 +653,16 @@ static void vps_job(const char *host, const char *port, const char *user, char *
 	_exit(0);
 }
 
-/* Настройки «Для опытных»: base64 строк «Параметр = значение», их разбирает и проверяет vps-setup.sh */
-static int valid_options(const char *s) {
+/* Аргумент в base64 не длиннее max: настройки «Для опытных» (строки «Параметр = значение», их разбирает
+ * и проверяет vps-setup.sh), имя устройства, ключ подключения */
+static int valid_base64(const char *s, size_t max) {
 	size_t n = strlen(s);
-	return n <= OPTIONS_MAX && strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") == n;
+	return n <= max && strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") == n;
 }
 
-static int cmd_vps_start(int argc, char **argv) {
-	if (argc != 6 && argc != 7) {
-		fprintf(stderr, "vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ ВЕРСИЯ СЕТЬ [НАСТРОЙКИ]\n");
-		return 2;
-	}
-	const char *host = argv[0], *port = argv[1], *user = argv[2], *secret = argv[3], *profile = argv[4],
-	           *subnet = argv[5], *options = argc > 6 ? argv[6] : "";
-	if (!valid_host(host) || !valid_number(port, 1, 65535) || !valid_user(user) || !valid_subnet(subnet) ||
-	    !valid_options(options) || !valid_number(profile, 1, 3)) { // AmneziaWG 1.0, 2.0 или 3.1
-		say(LOG_ERR, "vps: неверные параметры");
-		return 2;
-	}
+/* Пароль из vps-pad и аргументов, переменные для сценария (vars) → фоновая настройка с журналом kind. */
+static int vps_launch(const char *kind, const char *host, const char *port, const char *user, const char *secret,
+                      const char *vars) {
 	if (vps_job_pid()) {
 		say(LOG_WARNING, "vps: настройка сервера уже идёт");
 		return 1;
@@ -697,11 +694,12 @@ static int cmd_vps_start(int argc, char **argv) {
 	size_t script_len;
 	char *script = read_file(VPS_SCRIPT, &script_len);
 	FILE *in = script ? fopen(VPS "/stdin", "wb") : NULL;
-	ok = in && fprintf(in, "PROFILE=%s\nSUBNET=%s\nENDPOINT=%s\n", profile, subnet, host) > 0 &&
-	     (!*options || fprintf(in, "OPTIONS=%s\n", options) > 0) && fwrite(script, 1, script_len, in) == script_len;
+	ok = in && fputs(vars, in) >= 0 && fwrite(script, 1, script_len, in) == script_len;
 	if (in && fclose(in) != 0) ok = 0;
 	free(script);
-	ok = ok && write_text(VPS "/log", "") == 0 && write_text(VPS "/state", "running\n") == 0 &&
+	char job[32];
+	snprintf(job, sizeof job, "@@job %s\n", kind);
+	ok = ok && write_text(VPS "/log", job) == 0 && write_text(VPS "/state", "running\n") == 0 &&
 	     make_dir(VPS "/home") == 0 && make_dir(VPS "/home/.ssh") == 0;
 	unlink(VPS "/home/.ssh/known_hosts"); // новый сервер на старом адресе — не ошибка
 	if (!ok || access(DBCLIENT, X_OK) != 0) {
@@ -728,6 +726,45 @@ static int cmd_vps_start(int argc, char **argv) {
 	waitpid(pid, &status, 0);
 	puts("started");
 	return 0;
+}
+
+static int cmd_vps_start(int argc, char **argv) {
+	if (argc != 6 && argc != 7) {
+		fprintf(stderr, "vps-start АДРЕС ПОРТ ЛОГИН ПАРОЛЬ ВЕРСИЯ СЕТЬ [НАСТРОЙКИ]\n");
+		return 2;
+	}
+	const char *host = argv[0], *port = argv[1], *user = argv[2], *secret = argv[3], *profile = argv[4],
+	           *subnet = argv[5], *options = argc > 6 ? argv[6] : "";
+	if (!valid_host(host) || !valid_number(port, 1, 65535) || !valid_user(user) || !valid_subnet(subnet) ||
+	    !valid_base64(options, OPTIONS_MAX) || !valid_number(profile, 1, 3)) { // AmneziaWG 1.0, 2.0 или 3.1
+		say(LOG_ERR, "vps: неверные параметры");
+		return 2;
+	}
+	char vars[OPTIONS_MAX + 512];
+	int len = snprintf(vars, sizeof vars, "PROFILE=%s\nSUBNET=%s\nENDPOINT=%s\n", profile, subnet, host);
+	if (*options) snprintf(vars + len, sizeof vars - (size_t)len, "OPTIONS=%s\n", options);
+	return vps_launch("router", host, port, user, secret, vars);
+}
+
+/* Уже настроенный сервер: list — подключения, device ИМЯ — новое устройство, remove КЛЮЧ — удалить. */
+static int cmd_vps_device(int argc, char **argv) {
+	const char *action = argc > 4 ? argv[4] : "";
+	int list = strcmp(action, "list") == 0, device = strcmp(action, "device") == 0, remove = strcmp(action, "remove") == 0;
+	if (!(list && argc == 5) && !((device || remove) && argc == 6)) {
+		fprintf(stderr, "vps-device АДРЕС ПОРТ ЛОГИН ПАРОЛЬ list|device ИМЯ|remove КЛЮЧ\n");
+		return 2;
+	}
+	const char *host = argv[0], *port = argv[1], *user = argv[2], *secret = argv[3], *arg = argc > 5 ? argv[5] : "";
+	// имя — base64 до 120 байт текста (его ещё раз проверяет сценарий), ключ — 44 символа base64
+	int arg_ok = list || (device && *arg && valid_base64(arg, 160)) || (remove && strlen(arg) == 44 && valid_base64(arg, 44));
+	if (!valid_host(host) || !valid_number(port, 1, 65535) || !valid_user(user) || !arg_ok) {
+		say(LOG_ERR, "vps: неверные параметры");
+		return 2;
+	}
+	char vars[512];
+	snprintf(vars, sizeof vars, "MODE=%s\nENDPOINT=%s\n%s%s%s", action, host, device ? "NAME=" : remove ? "PEER=" : "", arg,
+	         list ? "" : "\n");
+	return vps_launch("device", host, port, user, secret, vars);
 }
 
 /* Строка журнала для веб-модуля. ndm обрывает вывод exec на управляющих символах («unable to communicate
@@ -892,6 +929,7 @@ int main(int argc, char **argv) {
 	if (strcmp(cmd, "resolve") == 0) return cmd_resolve(argc - 2, argv + 2);
 	if (strcmp(cmd, "vps-pad") == 0) return cmd_vps_pad();
 	if (strcmp(cmd, "vps-start") == 0) return cmd_vps_start(argc - 2, argv + 2);
+	if (strcmp(cmd, "vps-device") == 0) return cmd_vps_device(argc - 2, argv + 2);
 	if (strcmp(cmd, "vps-status") == 0) return cmd_vps_status(argc - 2, argv + 2);
 	if (strcmp(cmd, "vps-cancel") == 0) return cmd_vps_cancel();
 	if (strcmp(cmd, "vps-clear") == 0) return cmd_vps_clear();
