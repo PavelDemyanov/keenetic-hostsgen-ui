@@ -211,7 +211,7 @@ test('readStatus: работа окна «Устройства» — чья он
   const confLines = b64(conf).match(/.{1,40}/g);
   const job = vps.readStatus(
     ['@@state running 9 9', '@@job device', '@@step check Проверяю сервер', '@@step config Добавляю устройство «Телефон» (AmneziaWG 3.1)',
-      '@@server 3 41234', '@@now 1792000300',
+      '@@server 3 41234', '@@format amnezia', '@@now 1792000300',
       `@@peer ${key1} 10.75.144.2 1792000000 123 456 ${b64('роутер Keenetic, 2026-10-13 21:04')}`,
       `@@peer ${key2} 10.75.144.3 0 0 0 ${b64('устройство: Телефон, мой, 2026-10-23 20:15')}`,
       '@@conf-begin', confLines[0], 'process terminated'],
@@ -220,7 +220,13 @@ test('readStatus: работа окна «Устройства» — чья он
   // журнал пришёл двумя порциями: ndm дописал «process terminated» посреди настроек
   vps.readStatus(['@@state done 14 14', ...confLines.slice(1), '@@conf-end', '@@done', ''], job);
   assert.equal(job.kind, 'device');
-  assert.deepEqual(job.server, { profile: 3, port: '41234' });
+  assert.deepEqual(job.server, { profile: 3, port: '41234', format: 'amnezia' });
+  // сценарий модуля до 1.5 формат не писал
+  assert.deepEqual(vps.readStatus(['@@server 1 5555'], vps.newJob()).server, { profile: 1, port: '5555', format: '' });
+  assert.deepEqual(vps.readStatus(['@@server 1 5555', '@@format old'], vps.newJob()).server, { profile: 1, port: '5555', format: 'old' });
+  assert.match(vps.formatNote('amnezia'), /видны в приложении AmneziaVPN, и наоборот/);
+  assert.match(vps.formatNote('old'), /перейдёт в формат приложения Amnezia/);
+  assert.equal(vps.formatNote(''), '');
   assert.equal(job.now, 1792000300);
   assert.deepEqual(job.peers, [
     { key: key1, address: '10.75.144.2', handshake: 1792000000, rx: 123, tx: 456, kind: 'router', name: '', added: '2026-10-13 21:04' },
@@ -238,6 +244,9 @@ test('parsePeerLabel и peerTitle: роутеры, устройства, под�
   assert.deepEqual(vps.parsePeerLabel('роутер Keenetic, 2026-10-13 21:04'), { kind: 'router', name: '', added: '2026-10-13 21:04' });
   assert.deepEqual(vps.parsePeerLabel('роутер Keenetic'), { kind: 'router', name: '', added: '' });
   assert.deepEqual(vps.parsePeerLabel('устройство: Ноутбук, 2026-10-23 20:15'), { kind: 'device', name: 'Ноутбук', added: '2026-10-23 20:15' });
+  // подключение из приложения Amnezia без даты
+  assert.deepEqual(vps.parsePeerLabel('устройство: Client 1'), { kind: 'device', name: 'Client 1', added: '' });
+  assert.deepEqual(vps.parsePeerLabel('устройство: Дача, 5'), { kind: 'device', name: 'Дача, 5', added: '' });
   assert.deepEqual(vps.parsePeerLabel('ноутбук Васи'), { kind: 'other', name: 'ноутбук Васи', added: '' });
   assert.deepEqual(vps.parsePeerLabel(''), { kind: 'other', name: '', added: '' });
   assert.equal(vps.peerTitle({ kind: 'router' }, 'VPN Нидерланды'), 'Этот роутер — VPN Нидерланды');

@@ -115,8 +115,9 @@
   function parsePeerLabel(label) {
     const router = label.match(/^роутер Keenetic(?:, (.+))?$/);
     if (router) return { kind: 'router', name: '', added: router[1] || '' };
-    const device = label.match(/^устройство: (.*), (\d{4}-\d\d-\d\d \d\d:\d\d)$/);
-    if (device) return { kind: 'device', name: device[1], added: device[2] };
+    // у подключений, созданных в приложении Amnezia, даты может не быть
+    const device = label.match(/^устройство: (.*?)(?:, (\d{4}-\d\d-\d\d \d\d:\d\d))?$/);
+    if (device) return { kind: 'device', name: device[1], added: device[2] || '' };
     return { kind: 'other', name: label, added: '' };
   }
 
@@ -141,7 +142,10 @@
         job.kind = line.slice(6).trim();
       } else if (/^@@server \d \d+$/.test(line)) {
         const [, profile, port] = line.split(' ');
-        job.server = { profile: Number(profile), port };
+        job.server = { profile: Number(profile), port, format: '' };
+      } else if (/^@@format \w+$/.test(line)) {
+        // amnezia — сервер в формате приложения Amnezia, old — настроенный модулем до 1.5; идёт после @@server
+        if (job.server) job.server.format = line.slice(9);
       } else if (/^@@now \d+$/.test(line)) {
         job.now = Number(line.slice(6));
       } else if (line.startsWith('@@peer ')) {
@@ -264,6 +268,18 @@
   }
 
   /** Какие приложения подключатся к серверу этой версии AmneziaWG. */
+  /** Чем сервер связан с приложением AmneziaVPN — по формату из @@server. */
+  function formatNote(format) {
+    if (format === 'amnezia') {
+      return 'Сервер — в формате приложения Amnezia: подключения, добавленные здесь, видны в приложении AmneziaVPN, и наоборот.';
+    }
+    if (format === 'old') {
+      return 'Сервер настроен прежней версией модуля: при следующем добавлении или удалении он перейдёт в формат приложения Amnezia ' +
+        '(ключи и подключения сохранятся) — тогда его увидит и AmneziaVPN.';
+    }
+    return '';
+  }
+
   function deviceAppNote(profile) {
     const plain = 'Обычное приложение WireGuard не подойдёт: сервер ждёт маскировку AmneziaWG.';
     if (profile === 3) {
@@ -436,7 +452,7 @@
     // node --test: чистые функции без DOM
     module.exports = {
       awgProfile, awgName, profileNote, pickSubnet, maskPassword, newJob, readStatus, endpointHost, endpointPort, expertOptions, HOST_RE,
-      parsePeerLabel, peerTitle, linkText, formatBytes, deviceNameError, deviceFileName, deviceAppNote, toBase64, fromBase64,
+      parsePeerLabel, peerTitle, linkText, formatBytes, deviceNameError, deviceFileName, deviceAppNote, formatNote, toBase64, fromBase64,
     };
     return;
   }
@@ -1056,7 +1072,7 @@
       const { profile, port } = state.server || {};
       const count = state.peers.length;
       $('server-note').textContent = `Сервер ${state.target ? state.target.host : ''}: ${awgName(profile)}, UDP-порт ${port || '—'}, ` +
-        `${count} ${plural(count, 'подключение', 'подключения', 'подключений')}.`;
+        `${count} ${plural(count, 'подключение', 'подключения', 'подключений')}. ${formatNote(state.server && state.server.format)}`;
       $('app-note').textContent = deviceAppNote(profile);
       show('list');
     };
